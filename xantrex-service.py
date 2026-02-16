@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Version: 1.0.0.2026.01.25
-# Date: 2026-01-25
+# Version: 1.0.0.2026.02.16
+# Date: 2026-02-16
 
 # Xantrex Freedom Pro NMEA 2000 D-Bus Driver
 #
