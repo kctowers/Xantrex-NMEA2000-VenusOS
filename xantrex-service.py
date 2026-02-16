@@ -1,45 +1,43 @@
 #!/usr/bin/env python3
-# Version: 2.1.822.2025.10.30
-# Date: 2025-10-30
+# Version: 1.0.0.2026.01.25
+# Date: 2026-01-25
 
-# Xantrex Freedom Pro RV-C D-Bus Driver
+# Xantrex Freedom Pro NMEA 2000 D-Bus Driver
 #
-# This script reads raw RV-C (CAN) data from a Xantrex Freedom Pro inverter/charger
+
+# This script reads raw NMEA-2000 (CAN) data from a Xantrex Freedom Pro Marine inverter/charger
 # and publishes meaningful decoded values to the Venus OS D-Bus using com.victronenergy.inverter.can_xantrex.
-# Other RV-C  supporting inverters chargers may work as well.
 # 
-# Author: Scott  Sheen
-# website: sheenconsulting.com
+# Author: Kevin Towers
+#
+# This was based on the RV-C driver created by Scott Sheen
+# It can be found at https://github.com/ScottS45/Xantrex-Rvc-VenusOS
 #
 # Compatible with: Venus OS (standard installations with dbus, GLib, and python3)
-# Requirements: Connected CAN interface (default: can10) and appropriate udev/socket permissions
+# Requirements: Connected CAN interface (default: vecan0) and appropriate udev/socket permissions
 #
 # Features:
-# - Decodes known Xantrex RV-C DGNs and maps them to Victron D-Bus paths
-# - Auto-registers standard D-Bus monitoring paths for inverter/chargers under /Mgmt/xantrex-rvc
-# - Supports logging flags (--debug,  --verbose)
+# - Decodes known Xantrex NMEA-2000 PGNs and maps them to Victron D-Bus paths
+# - Auto-registers standard D-Bus monitoring paths for inverter/chargers under /Mgmt/xantrex-nmea
+# - Supports logging flags (--log,  --verbose)
 # - Includes /Status reporting, derived power calculations, and GLib heartbeat timers
+#
+#
+# Packet decoding information came from the following web pages:
+# https://xantrex.com/wp-content/uploads/2021/12/976-0422-01-01_Rev-ANMEA2000-PGN-List-for-FXCC_ENG.pdf
+# https://canboat.github.io/canboat/canboat.html
+# Also from lot of trial and error testing and reverse engineering CAN packets.
 #
 # Based on Venus OS community conventions (e.g., GuiMods, dbus-serialbattery)
 #
-# Tip: Add udev rule for CAN permissions (e.g., /etc/udev/rules.d/99-can.rules):
-# ACTION=="add", SUBSYSTEM=="net", KERNEL=="ncan10", RUN+="/sbin/ip link set up can10 type can bitrate 250000"
-
 
 # --- Venus OS Compatibility Notes ---
-# This service was developed on Venus OS v3.5 and forward-compatible with v3.6+
+# This service was developed on Venus OS (Large) V3.67
 #
-# IMPORTANT API Differences in VeDbusServiceWithMeta:
-# - In v3.5:
-#     • add_path() supports `description` only
-#     • `unit` is NOT accepted → will raise: unexpected keyword argument 'unit'
-# - In v3.6 and newer:
-#     • add_path() supports both `description` and `unit`
-#     • Recommended to call `set_register(False)` before path setup, then `registertemper
-#
-# Upgrading to Venus OS 3.6+ will unlock full D-Bus metadata support.
-
-
+# This code supports a single instance of a Xantrrex inverter on the CAN bus.
+# Because of this, we don't care what node ID any of the data packets come
+# from.  If you want to support multiple instances, future upgrades my include
+# commandline options to associate CAN Id with instance numbers.
 
 # --- Import standard and system libraries ---
 import sys
@@ -51,57 +49,43 @@ import logging
 import signal
 import time
 import re
+import enum
 import dbus
 import dbus.mainloop.glib
 
+from functools     import partial
 from collections   import defaultdict
 from typing        import Any, Optional, Set, Dict, List
 from gi.repository import GLib
 import argparse
 
 
-
 # ─── Load our locally vendored Velib Python library ───
-# We have manually placed the velib_python package under
-# /data/xantrex-monitor/velib_python so that:
+
+# We have manually placed the velib_python package under /data/xantrex-monitor/velib_python so that:
 #  • We control the exact Vedbus implementation (tested for no root-“/” binding)
 #  • It lives in /data and survives both reboots and firmware updates
 #  • We can safely instantiate two VeDbusServiceWithMeta services on one bus
 #
+# This can be found at https://github.com/victronenergy/velib_python
+#
 # Prepending this path ensures all “import vedbus” calls use our vendored copy first.
 sys.path.insert(0, '/data/xantrex-monitor/velib_python')
-
-
+from vedbus import VeDbusItemImport
 import vedbus
 
-
 # --- Constants defining service identity and CAN parameters ---
-DEVICE_INSTANCE     = 252       # just radomly picked, can not clash with one already on the system.
-PRODUCT_ID          = 0xA045
-FIRMWARE_VERSION    = '2.14'    # hard coded, matches mine.  Can be picked up by DGN though it is not transmitted when requested.
-PRODUCT_NAME        = 'Freedom XC Pro'
-SCRIPT_VERSION      = '2.1.705.2025.09.08'
-MAX_UNMAPPED_DGNS   = 100
+DEVICE_INSTANCE        = 0                      # This driver only supports a single instance, so hardcoded here
+PRODUCT_ID             = 1234
+FIRMWARE_VERSION       = '2.14'    # hard coded, matches mine.
+XANTREX_INVERTER_MODEL = 2000                   # 2000 or 3000 Watt inverter
+PRODUCT_NAME           = 'Freedom XC Pro ' + str(XANTREX_INVERTER_MODEL) + ' Marine'
+SCRIPT_VERSION         = '1.0.0.2026.01.25'
+MAX_UNMAPPED_PGNS      = 100
 
 # ManufacturerCode = 119
 
-# map raw RV-C codes → Venus OS GUI /State enum
-RVC_INV_STATE = {
-    0: 0,  # Not Available → Off
-    1: 9,  # Invert    -> Inverting  
-    2: 8,  # Pass thru
-    3: 11, # APS only  -> Power supply
-    4: 1,  # Load sense -> Standby/Idle
-    5: 1,  # Waiting to Invert -> Standby/Idle
-    6: 2,  # Short-Circuit → Fault
-    7: 2,  # Over-Temperature → Fault
-    8: 2,  # Under-Voltage → Fault
-    9: 2,  # Over-Voltage → Fault
-    10: 2,  # Internal-Fault → Fault
-    11: 2,  # Comm-Lost → Fault
-}
-
-RVC_CHG_STATE = {
+INV_CHG_STATE = {
     0: 0,   #  NA/init       → Off
     1: 0,   #  Not charging  Maybe this needs to be 1: 1
     2: 3,   #  Bulk
@@ -109,59 +93,54 @@ RVC_CHG_STATE = {
     4: 4,   #  Absorption
     5: 7,   #  Equalize
     6: 5,   #  Float
-    # RV-C never sends 7–15, but Venus supports 8–11:  So I read, but never know so this is here anyways.
+    7: 7,   #  Equalize
     8: 8,   #   — passthru     → Passthru
     9: 9,   #   — inverting    → Inverting
     10: 10, #   — assisting    → Assisting
     11: 11, #   — psu          → Power supply
 }
-
+      
+# These are values that the GUI will send down to change the operating mode of
+# Inverter/Charger
+MODE_CHARGER = 1
+MODE_INVERTER = 2
+MODE_ON = 3                                     # operates in both inverter and charger modes
+MODE_OFF = 4
 
 # === CLI Argument Parsing ===
-parser = argparse.ArgumentParser()
-parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-parser.add_argument('--verbose', action='store_true', help='Full verbose logging')
-parser.add_argument('--can',     default='can10',     metavar='IFACE',  help='SocketCAN interface to listen on (default: can10)')
+parser = argparse.ArgumentParser(allow_abbrev = True)
+parser.add_argument('--log', default='WARNING', 
+    help='Set the logging level (Default: WARNING)')
+parser.add_argument('--verbose', action='store_true', help='Print all logging to terminal')
+parser.add_argument('--can',     default='vecan0',     metavar='IFACE',  help='SocketCAN interface to listen on (default: vecan0)')
 args = parser.parse_args()
 
-CAN_INTERFACE = args.can   # default is can10, that is what I used.
+CAN_INTERFACE = args.can
 RCVBUF_BYTES  = 1 * 1024 * 1024          # we want 1 MiB payload room
 
 
 # === Configure Logging ===
 # make the dir if it is not there
 # remove the existing log to start fresh.  
-
 LOG_DIR = '/data/xantrex-monitor/logs'
 os.makedirs(LOG_DIR, exist_ok=True)
 
-log_file_path = f'{LOG_DIR}/xantrex.log'
-if os.path.exists(log_file_path):
-    os.remove(log_file_path)
-
 logger = logging.getLogger("xantrex")
-logger.handlers.clear()        # remove any inherited handlers
-logger.propagate = False       # don’t duplicate to root logger
+logger.handlers.clear()                         # remove any inherited handlers
+logger.propagate = False                        # don’t duplicate to root logger 
+# choose level
+logger.setLevel (args.log.upper())              # level comes from command line
 
-if args.debug or args.verbose:
-    # choose level
-    level = logging.DEBUG if args.debug else logging.INFO
+fh = logging.FileHandler(f'{LOG_DIR}/xantrex.log', mode='w') # 'w' forces a overwrite if file already exists
+fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-    logger.setLevel(level)
-
-    handlers = [
-        logging.FileHandler(f'{LOG_DIR}/xantrex.log'),
-        logging.StreamHandler(sys.stdout)      # explicit to stdout
-    ]
-    for h in handlers:
-        h.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(h)
-else:
-    logger.setLevel(logging.ERROR)
-    fh = logging.FileHandler(f'{LOG_DIR}/xantrex.log')
-    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(fh)                           # always log to a file
+# and if requested, output everything to the terminal as well
+if args.verbose:
+    fh = logging.StreamHandler(sys.stdout)
     logger.addHandler(fh)
 
+    
 # ─── SET UP D-BUS TO USE THE GLIB MAIN LOOP ───
 # We need D-Bus events (method calls, signals, introspection requests)
 # to be dispatched via GLib so they integrate with our CAN I/O loop.
@@ -169,7 +148,6 @@ else:
 # subsequent BusConnection (including private ones) will use GLib.
 # This must appear *before* creating any BusConnection, hence its
 # placement at the top of the module.
-
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     
 # Create a shared GLib-backed loop instance for all private connections
@@ -177,14 +155,14 @@ glib_loop = dbus.mainloop.glib.DBusGMainLoop()
    
 def new_system_bus():
     # Return a private SystemBus connection that dispatches on our shared GLib loop, so multiple VeDbusService instances don’t collide on '/'.
-    
     return dbus.SystemBus( mainloop = glib_loop, private = True )
     
+
+
     
-    
-# === Supported DGNs used by Venus OS ===
+# === Supported PGNs used by Venus OS ===
 # ------------------------------------------------------------------------------
-# Decoder functions for the DGN_MAPs that safely extract numeric values from CAN data.
+# Decoder functions for the PGN_MAPs that safely extract numeric values from CAN data.
 # These functions automatically return None if the raw value is masked or invalid
 # according to RV-C and J1939 standards:
 #   - 0xFF       for 8-bit fields
@@ -286,17 +264,20 @@ def safe_s16(data: bytes | memoryview, offset: int, scale: float = 1.0, byteorde
         
     return raw if scale == 1.0 else round(raw * scale, 3)
     
-    
-def safe_s32(data: bytes | memoryview, offset: int, scale: float = 1.0) -> Optional[float]:
-    # Signed 32-bit LE. 0x7FFFFFFF ⇒ NA per RV-C.
-    if len(data) < offset + 4: return None
-        
-    raw, = _UNPACK_S32(data, offset)
-    return None if raw == 0x7FFFFFFF else round(raw * scale, 3)
-
 
 # OTHER DECODERS
     
+def safe_s24(data: bytes | memoryview, offset: int, scale: float = 1.0) -> Optional[float]:
+    # Signed 24-bit LE. 
+    if len(data) < offset + 3: return None  
+    
+    value = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16)
+
+    # Sign-extend if the 24th bit is set
+    if value & 0x800000:
+        value -= 1 << 24
+
+    return round(value * scale, 3)
 
 def safe_bit(byte_val: int, mask: int) -> Optional[bool]:
     # Return True if the bitmask is set, False if clear, or None if the whole byte is marked Not-Available. 
@@ -316,552 +297,81 @@ def safe_ascii(data_slice):
     except UnicodeDecodeError:
         return None       
         
-
-# Xantrex encodes charger/inverter current as a LITTLE-ENDIAN u16 with a zero-offset at 0x7D00
-# (per docs: “special value 0 A = 0x7D00”). The physical scale is fixed at 0.05 A/bit.
-# We also treat 0xFFFF as N/A.
-def u16_current(d: bytes, off: int = 3) -> float | None:
-    raw = d[off] | (d[off + 1] << 8)   # Little E u16
-    if raw == 0xFFFF:
-        return None
-
-    delta = raw - 0x7D00   # -1600
-    if delta == 0:
-        return 0.0
-
-    return delta * 0.05  # maybe we need to round this?
-
-
-    
 def fahrenheit_to_c(val):
     return None if val is None else round((val - 32) * 5/9, 1)
 
 
+class NMEA2000:
+    # not sure what module this was to come from, but we need it to send a 29-bit CAN frame
+    CAN_EFF_FLAG        = 0x80000000
 
-# === DGN Map: Decoders from RV-C DGNs to D-Bus paths ===
-# Format: DGN : [(dbus_path, decode_function), ...]
-# Each DGN (Diagnostic Group Number) corresponds to a specific RV-C data packet
-# The lambda decoders extract meaningful values (voltage, current, state, etc.) from the binary payload
-# Units and scaling factors are defined by the RV-C specification or device-specific implementation
-
-#*********   N  O   T   E    ****************
-#*******  see some voltage /Current decoders are even numbered for some.  Those are ones I have not received back and they are most likely off by 1.  IE should 1 vs 2, 3 instead of 4. etc.  I am not worried about it until the data comes back.
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  INVERTER_DGN_MAP  
-# ─────────────────────────────────────────────────────────────────────────────
-INVERTER_DGN_MAP = {
-    0x1FFD4: [  # INVERTER_STATUS              This is charger if the address is the primary *(0x42 default) or inverter if not that.
-        ('/State',                     lambda d: RVC_INV_STATE.get((int(safe_u8(d, 1) or 0)) & 0x0F, 0),  '',  'Inverter operational state (0=Off,1=Standby,2=InvOnly,3=Bypass,4=Inv+Chg)'),
-         # Bytes 3–7 are NA
-    ],
-    0x1EE00: [  # ADDRESS_CLAIMED / NAME
-        ('/Mgmt/ManufacturerCode',     lambda d: ((int.from_bytes(d[:8], 'little') >> 21) & 0x7FF) if len(d) >= 8 else None,  '', 'RV-C manufacturer code (119 = Xantrex)'),
-        ('/Mgmt/Function',             lambda d: ((int.from_bytes(d[:8], 'little') >> 40) & 0xFF)  if len(d) >= 8 else None,  '', 'RV-C function (129 = Inverter/Charger)'),
-    ],    
-    0x1FEEF: [  # SOFTWARE_IDENTIFICATION  Ignored by Charger
-        ('/Firmware/PartNumber',       lambda d: safe_ascii(d[0:16]),            '',      'FW part-number (optional)'),
-        ('/Firmware/BuildDate',        lambda d: safe_ascii(d[16:24]),           '',      'FW build date YYYYMMDD'),
-    ],
-    0x1FFDE: [  # INVERTER_MODEL_INFO
-        ('/Info/Model',                lambda d: safe_ascii(d[0:8]),             '',      'ASCII model string'),
-        ('/Info/Serial',               lambda d: safe_ascii(d[8:20]),            '',      'Serial number'),
-        ('/Info/HardwareVersion',      lambda d: safe_ascii(d[20:28]) if len(d) >= 28 else '',  '', 'Hardware revision'),
-    ],
-    0x1FFDC: [  # INVERTER_AC_STATUS_2
-        ('/Ac/In/V',                   lambda d: safe_u16(d, 0, 0.05),           'V',     'AC Input Voltage'),
-        ('/Ac/In/F',                   lambda d: safe_u16(d, 2, 0.01),           'Hz',    'AC Input Frequency'),
-        ('/Ac/In/L1/V',                lambda d: safe_u16(d, 0, 0.05),           'V',     'AC Input L1 Voltage (alias)'),
-        ('/Ac/In/L1/F',                lambda d: safe_u16(d, 2, 0.01),           'Hz',    'AC Input L1 Frequency (alias)'),
-        ('/Ac/In/L1/I',                lambda d: u16_current(d, 3),              'A',     'AC Input L1 Current'),
-        ('/Ac/Grid/L1/V',              lambda d: safe_u16(d, 0, 0.05),           'V',     'AC Input L1 Voltage (Grid)'),
-        ('/Ac/Grid/L1/I',              lambda d: u16_current(d, 3),              'A',     'AC Input L1 Current (Grid)'),
-        ('/Ac/Grid/L1/ApparentPower',  lambda d: (None if safe_u16(d, 0, 0.01) is None or safe_u8(d, 3, 0.05) is None else round(safe_u16(d, 0, 0.01) * safe_u8(d, 3, 0.05), 1)), 'VA', 'AC Input L1 Apparent Power (Grid)'),
-    ],
-    0x1FFD7: [  # INVERTER_AC_STATUS_1
-        ('/Ac/Out/L1/V',               lambda d: safe_u16(d, 1, 0.05),           'V',     'AC Output L1 Voltage'),
-        ('/Ac/Out/L1/I',               lambda d: u16_current(d, 3),              'A',     'AC Output L1 Current'),
-        ('/Ac/Out/L1/F',               lambda d: safe_u16(d, 5, 2.0, 'big'),     'Hz',    'AC Output Frequency'),
-        ('/Ac/Out/V',                  lambda d: safe_u16(d, 1, 0.05),           'V',     'AC Output L1 Voltage'),
-        ('/Ac/Out/I',                  lambda d: u16_current(d, 3),              'A',     'AC Output L1 Current'),
-        ('/Ac/Out/F',                  lambda d: safe_u16(d, 5, 2.0, 'big'),     'Hz',    'AC Output Frequency'),
-    ],
-    0x1FEE8: [  # INVERTER_DC_STATUS
-        ('/Dc/0/Voltage',              lambda d: safe_u16(d, 1, 0.05, 'little'), 'V',     'DC 0 Voltage'),
-        ('/Dc/0/Current',              lambda d: u16_current(d, 3),              'A',     'DC 0 Current'),
-        ('/Dc/Voltage',                lambda d: safe_u16(d, 1, 0.05, 'little'), 'V',     'DC 0 Voltage'),
-        ('/Dc/Current',                lambda d: u16_current(d, 3),              'A',     'DC 0 Current'),
-    ],
-    0x1FEA2: [  # INVERTER_STATUS_2 (DC Input Voltage & Current)
-        ('/Dc/0/Voltage',              lambda d: safe_u16(d, 2, 0.05),           'V',     'DC Input Voltage'),
-        ('/Dc/0/Current',              lambda d: safe_u16(d, 4, 0.01),           'A',     'DC Input Current'),
-    ],
-    0x1FFCD: [  # INVERTER_APS_STATUS
-        ('/Ac/Out/L1/F',               lambda d: safe_u16(d, 5, 2.0, 'big'),     'Hz',    'AC Output L1 Frequency'),
-        ('/Ac/Out/L1/S',               lambda d: safe_u16(d, 2),                 'VA',    'AC Output L1 Apparent Power'),
-        ('/Ac/Out/L1/P',               lambda d: safe_u16(d, 4),                 'W',     'AC Output L1 Active Power'),
-        ('/Ac/Out/L1/Q',               lambda d: safe_u16(d, 6),                 'VAR',   'AC Output L1 Reactive Power'),
-    ],
-    0x1FFCC: [  # INVERTER_DCBUS_STATUS
-        ('/Dc/0/Voltage',              lambda d: safe_u16(d, 0, 0.1),            'V',     'DC Voltage'),
-        ('/Dc/0/Current',              lambda d: safe_u16(d, 2, 0.1),            'A',     'DC Current'),
-    ],
-    0x1FFCB: [  # INVERTER_OPS_STATUS
-        ('/State',                     lambda d: safe_u8(d, 0),                  '',      'Inverter State'),
-        ('/Error',                     lambda d: safe_u8(d, 1),                  '',      'Inverter Error Code'),
-    ],
-    0x1FFD5: [  # INVERTER_AC_STATUS_3
-        ('/Ac/Out/L1/Flags',          lambda d: safe_u8(d,  1),                  '',      'Waveform & phase flags'),
-        ('/Ac/Out/L1/P',              lambda d: safe_u16(d, 2),                  'W',     'Real power'),
-        ('/Ac/Out/L1/Q',              lambda d: safe_u16(d, 4),                  'VAR',   'Reactive power'),
-        # bytes 6–7 reserved/not available
-    ],
-    0x1FFD6: [  # INVERTER_AC_STATUS_2
-        ('/Ac/Out/V',                  lambda d: safe_u16(d, 0, 0.05),           'V',     'AC Voltage'),
-        ('/Ac/Out/F',                  lambda d: safe_u16(d, 2, 0.01),           'Hz',    'AC Frequency'),
-    ],
-    0x1FF8F: [  # INVERTER_AC_STATUS_4
-        ('/Ac/Out/Instance',           lambda d: safe_u8(d, 0),                  '',      'AC-point instance'),
-        ('/Ac/Out/VoltageFaultCode',   lambda d: safe_u8(d, 1),                  '',      'Voltage-fault enumeration'),
-        ('/Ac/Out/Fault/Surge',        lambda d: safe_bit(d[2], 0x03),           '',      'Surge-protection fault'),
-        ('/Ac/Out/Fault/FreqHigh',     lambda d: safe_bit(d[2], 0x0C),           '',      'High-frequency fault'),
-        ('/Ac/Out/Fault/FreqLow',      lambda d: safe_bit(d[2], 0x30),           '',      'Low-frequency fault'),
-        ('/Ac/Out/BypassActive',       lambda d: safe_bit(d[2], 0x40),           '',      'Bypass mode active'),
-        ('/Ac/Out/QualificationStatus',lambda d: (int(safe_u8(d, 3)) & 0x0F) if safe_u8(d, 3) is not None else None, '',      'Qualification status (0-4)'),
-    ],
-    0x1FFDD: [  # INVERTER_POWER_SUMMARY
-        ('/Ac/Out/Total/P',            lambda d: safe_s16(d, 0, 1.0),            'W',     'Total Active Power'),
-        ('/Ac/Out/Total/Q',            lambda d: safe_s16(d, 2, 1.0),            'VAR',   'Total Reactive Power'),
-        ('/Ac/Out/Total/S',            lambda d: safe_u16(d, 4, 1.0),            'VA',    'Total Apparent Power'),
-        ('/Ac/Out/Total/PowerFactor',  lambda d: safe_s16(d, 6, 0.001),          '',      'Power Factor'),
-    ],
-    0x1FEBE: [  # INVERTER_LOAD_PRIORITY
-        ('/Settings/InputPriority',    lambda d: safe_u8(d, 0),                  '',      'Input Priority'),
-        ('/Settings/LoadSheddingMode', lambda d: safe_u8(d, 1),                  '',      'Load Shedding Enabled'),
-        ('/Settings/InverterMode',     lambda d: safe_u8(d, 2),                  '',      'Inverter Operating Mode'),
-    ],
-    0x1FFF1: [  # AC_INPUT_LIMITS
-        ('/Ac/In/L1/CurrentLimit',     lambda d: safe_u8(d,0),                   'A',     'AC Input L1 Current Limit'),
-    ],
-    0x1FFB0: [  # AC_PASS_THROUGH_CONFIG
-        ('/Ac/PassThrough/Enabled',    lambda d: safe_u8(d, 0),                  '',      'Pass Through Mode Enabled'),
-        ('/Ac/PassThrough/Source',     lambda d: safe_u8(d, 1),                  '',      'Pass Through Source Selection'),
-        ('/Ac/PassThrough/Delay',      lambda d: safe_u16(d, 2, 0.1),            's',     'Pass Through Delay Time'),
-    ],
-    0x0EEFF: [  # INVERTER_ACTIVITY_STATUS (heartbeat)
-        ('/Mgmt/ProcessAlive',         lambda d: safe_u8(d, 0),                  '',      'Heartbeat value (non-zero = alive)'),
-    ],
-
-    0x1FE80: [  # AC_OUTPUT_STATUS – line-to-line voltage
-        ('/Blackhole',                 lambda d: None, '',''),  # Discard without processing
-        #('/Ac/Out/L1/Voltage',         lambda d: safe_u8(d, 1),                  'V',     'AC Output L1 Voltage'),
-    ],
-    0x1FE82: [  # AC_OUTPUT_FREQUENCY
-       ('/Blackhole',                  lambda d: None, '',''),  # Discard without processing
-       #('/Ac/Out/L1/Frequency',       lambda d: safe_u16(d, 2, 0.5) or 60,     'Hz',    'AC Output frequency'),
-    ],
-    0x0FECA: [  # Inverter Loss
-       ('/Energy/InverterOut',         lambda d: safe_u16(d, 0, 1, 'big'),       'Wh',   'Accumulated inverter output energy'        ),   # bytes 0–1 BE, 1 Wh/bit
-    ],
-    0x1FECA: [  # priority-1
-       ('/Energy/InverterOut',         lambda d: safe_u16(d, 0, 1, 'big'),       'Wh',   'Accumulated inverter output energy'        ),   # bytes 0–1 BE, 1 Wh/bit
-    ],    
-    0x1FFB7: [  # INVERTER_STATE
-        ('/sState',                     lambda d: int(safe_u8(d, 0) or 0),        '',      'Inverter state (Victron enum)'),        # I disabled this path, or have so we just use the other dgn.
-    ],
-    0x1FEB3: [  # ALARM_EVENT
-        ('/Alarms/RvcEvent',           lambda d: safe_u8(d, 0),                  '',      'RV-C alarm/event code'),
-    ],
-    0x1FFFC: [  # NETWORK_STATUS
-        ('/Mgmt/NetworkState',         lambda d: 0 if len(d) == 8 and all(b == 0 for b in d) else 1, '',    'Network state (all zeros = idle)'),
-    ],
-    0x1FFBE: [  # AC_PASS_THROUGH_STATUS
-        ('/Ac/PassThrough/Active',     lambda d: safe_u8(d, 0),                  '',      'Pass Through Active Flag'),
-        ('/Ac/PassThrough/LoadShare',  lambda d: safe_u8(d, 1),                  '',      'Load Sharing Mode'),
-        ('/Ac/PassThrough/SyncStatus', lambda d: safe_u8(d, 2),                  '',      'Synchronization Status'),
-    ]
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CHARGER_DGN_MAP
-# ─────────────────────────────────────────────────────────────────────────────
-CHARGER_DGN_MAP = {
-    0x1FDFF: [  # CHARGER_MODE_STATUS
-        ('/Mode',                    lambda d: safe_u8(d, 0),                    '',      'Charger mode (standby)'),
-    ],
-    0x1FFC7: [  # CHARGER_STATUS
-        ('/TargetVoltage',           lambda d: safe_u16(d, 1, 0.05, 'little'),   'V',     'Charge control voltage (target)'),
-        ('/TargetCurrent',           lambda d: u16_current(d, 3),                'A',     'Charge control current (target)'),
-        ('/Dc/0/Voltage',            lambda d: safe_u16(d, 1, 0.05, 'little'),   'V',     'Battery Voltage'),
-        ('/Dc/0/Current',            lambda d: u16_current(d, 3),                'A',     'Battery Charge Current'),
-        ('/Battery/Voltage',         lambda d: safe_u16(d, 1, 0.05, 'little'),   'V',     'Battery Voltage'),
-        ('/Battery/Current',         lambda d: u16_current(d, 3),                'A',     'Battery Charge Current'),
-        ('/Dc/0/PowerPercent',       lambda d: safe_u8( d, 5),                   '%',     'Charge current as % of maximum'),
-        ('/State',                   lambda d: RVC_CHG_STATE.get(int(safe_u8(d, 6) or 0), 0), '', 'Charger operating state'),
-    ],
-    0x1FEA3: [  # CHARGER_STATUS_2 (Battery Voltage & Current)   # this only seems to come in on source 25, which we skip since it is not a xantrex source but victron
-        ('/Dc/0/Voltage',            lambda d: safe_u16(d, 2, 0.05),             'V',     'Battery Voltage'),
-        ('/Dc/0/Current',            lambda d: safe_u16(d, 4, 0.05),             'A',     'Battery Charge Current'),
-        ('/Dc/0/Temperature',        lambda d: safe_s8(d, 6),                    '°C',    'Charger Temperature'),        
-    ],
-    0x1FFC8: [  # CHARGER_AC_STATUS_3 AC Input L1 
-        ('/Ac/In/L1/Flags',          lambda d: safe_u8(d, 1),                    '',    'Waveform & phase flags'),
-        ('/Ac/In/L1/Distortion',     lambda d: safe_u8(d, 6),                    '%',   'Harmonic distortion'),
-        # byte 7 complementary‑leg instance (NA here)
-    ],
-    0x1FFC6: [  # CHARGER_CONFIGURATION_STATUS   # not seen in 2 months of logs
-        ('/Status',                  lambda d: safe_u8(d, 0),                    '',      'Charger Status'),
-        ('/TargetVoltage',           lambda d: safe_u16(d, 1, 0.01),             'V',     'Target Voltage'),
-        ('/TargetCurrent',           lambda d: u16_current(d, 3),                'A',     'Target Current'),
-        ('/MaximumCurrent',          lambda d: safe_u16(d, 5, 0.1),              'A',     'Maximum Current'),
-    ],
-    0x1FFC5: [  # CHARGER_COMMAND
-        ('/Mode',                    lambda d: safe_u8(d, 0),                    '',      'Charger Mode'),
-        ('/Enabled',                 lambda d: int(safe_u8(d, 0) in (1, 2)),     '',      'Charger Enabled Flag'),
-    ],
-    0x1FFC2: [  # CHARGER_APS_STATUS
-        ('/Frequency',               lambda d: safe_u8(d, 0, 0.01),              'Hz',    'Charger Frequency'),
-        ('/Ac/In/L1/V',              lambda d: safe_u16(d, 2, 0.01),             'V',     'Charger Input L1 Voltage'), 
-        ('/Ac/In/L1/I',              lambda d: safe_u16(d, 4, 0.05),             'A',     'Charger Input L1 Current'), 
-    ],
-    0x1FFC1: [  # CHARGER_DCBUS_STATUS
-        ('/Dc/0/Voltage',            lambda d: safe_u8(d, 0, 0.01),              'V',     'DC Bus Voltage 1'),
-        ('/Dc/0/Current',            lambda d: safe_u8(d, 1,  0.1),              'A',     'DC Bus Current 1'),
-    ],
-    0x1FFC0: [  # CHARGER_OPS_STATUS
-        ('/State',                   lambda d: safe_u8(d, 0),                    '',      'Charger State'),
-        ('/Error',                   lambda d: safe_u8(d, 1),                    '',      'Charger Error'),
-    ],
-    0x1FF98: [  # CHARGER_EQUALIZATION_CONFIG_STATUS
-        ('/BulkTimeLimit',           lambda d: safe_u8(d, 0),                    '',      'Bulk Phase Time Limit'),
-        ('/AbsorptionTimeLimit',     lambda d: safe_u8(d, 1),                    '',      'Absorption Phase Time Limit'),
-        ('/EqualizationTimeLimit',   lambda d: safe_u8(d, 2),                    '',      'Equalization Phase Time Limit'),
-    ],
-    0x1FEBF: [  # CHARGER_CONFIG_STATUS_4
-        ('/FloatTimeLimit',          lambda d: safe_u8(d, 0),                    '',      'Float Phase Time Limit'),
-    ],
-    # ─────────────────────────────────────────────────────────────────────
-    # 0x1FFC9  —  Dual-use PGN on Xantrex Freedom XC / Pro
-    #
-    # According to the Xantrex RV-C guide this PGN alternates every second:
-    #
-    #   even seconds  →  “CHARGER_AC_STATUS_2”
-    #                    • L2 line-to-neutral voltage / current / power
-    #                    • meant for split-phase systems the Freedom XC
-    #                      does not actually support
-    #
-    #   odd  seconds  →  “CHARGER_APS_STATUS”
-    #                    • Auxiliary-Power-Supply (12 V) telemetry
-    #                      (instance#, count, V, I, internal °C)
-    #
-    # Venus OS ignores the L2 metrics on single-phase inverters, but APS
-    # data can be useful for diagnostics (Node-RED, MQTT, VRM widgets).
-    #
-    # Therefore we decode *only* the APS variant below.  If a future
-    # model supplies genuine split-phase numbers, add a dynamic decoder
-    # that inspects byte 0 and routes to /Ac/In/L2/* paths as needed.
-    # ─────────────────────────────────────────────────────────────────────    
-    0x1FFC9: [   # CHARGER_APS_STATUS
-        # dynamic router: first byte tells which variant we received
-        # ------------------------------------------------------------
-        # Battery variant (byte 0 == 0x01)
-        ('/Battery/Instance',               lambda d: safe_u8(d, 0)        if d[0] == 0x01 else None,  '',    'Battery Instance'),
-        ('/Soc',                            lambda d: safe_u8(d, 1) * 0.4  if d[0] == 0x01 else None,  '%',   'State of Charge'),
-        ('/Battery/Soh',                    lambda d: safe_u8(d, 2) * 0.4  if d[0] == 0x01 else None,  '%',   'State of Health'),
-        ('/Battery/Mode',                   lambda d: safe_u8(d, 3)        if d[0] == 0x01 else None,  '',    'Battery Mode'),
-        ('/Battery/Voltage',                lambda d: safe_u16(d, 4, 0.01) if d[0] == 0x01 else None,  'V',   'Battery Voltage'),
-        ('/Battery/Current',                lambda d: safe_u16(d, 6, 0.1)  if d[0] == 0x01 else None,  'A',   'Battery Current'),
-        ('/Battery/Power',                  lambda d: ( None if d[0] != 0x01 
-                                                               or safe_u8(d, 3, 0.05) is None 
-                                                               or safe_s16(d, 6, 0.1) is None
-                                                             else round(safe_u8(d, 3, 0.05) * safe_s16(d, 6, 0.1), 1)),
-                                                                                                       'W',   'Battery Power'),
-        # APS variant (byte 0 == 0x02) – keep if you want the 12 V aux data
-        ('/Dc/Aux/Instance',                lambda d: safe_u8(d, 0) if d[0] == 0x02 else None,         '',    'APS Instance'),
-        ('/Dc/Aux/Voltage',                 lambda d: safe_u16(d, 2, 0.05) if d[0] == 0x02 else None,  'V',   'APS output voltage'),
-        ('/Dc/Aux/Current',                 lambda d: safe_u16(d, 4, 0.05) if d[0] == 0x02 else None,  'A',   'APS output current'),
-        ('/Dc/Aux/Temperature',             lambda d: safe_s8(d, 6) if d[0] == 0x02 else None,         '°C',  'APS internal temp'),
-    ],    
-    0x1CA42: [  # CHARGER_STATUS_FLAGS
-        ('/StatusFlags',                    lambda d: safe_u8(d, 0),                '',      'Charger Status Flags'),
-        ('/Flag/Enabled',                   lambda d: safe_bit(d[0], 0x01),         '',      'Charger Enabled'),
-        ('/Flag/Derating',                  lambda d: safe_bit(d[0], 0x02),         '',      'Charger Derating Active'),
-        ('/Flag/BattLowVoltage',            lambda d: safe_bit(d[0], 0x04),         '',      'Battery Voltage Too Low'),
-        ('/Flag/BattHighVoltage',           lambda d: safe_bit(d[0], 0x08),         '',      'Battery Voltage Too High'),
-        ('/Flag/BattHighTemp',              lambda d: safe_bit(d[0], 0x10),         '',      'Battery Temperature Too High'),
-        ('/Flag/BattLowTemp',               lambda d: safe_bit(d[0], 0x20),         '',      'Battery Temperature Too Low'),
-        ('/Flag/ChargerHighTemp',           lambda d: safe_bit(d[0], 0x40),         '',      'Charger Temperature Too High'),
-        ('/Flag/ChargerLowTemp',            lambda d: safe_bit(d[0], 0x80),         '',      'Charger Temperature Too Low'),
-    ],
-    0x0CA42: [  # CHARGER DECODERS
-        ('/FanSpeed',                       lambda d: safe_u8(d, 0),                '',      'Charger Fan Speed'),
-        ('/Derating',                       lambda d: safe_u8(d, 1),                '%',     'Charger Derating (%)'),
-        ('/InputMode',                      lambda d: safe_u8(d, 2),                '',      'Charger Input Mode'),
-        ('/InputSource',                    lambda d: safe_u8(d, 3),                '',      'Charger Input Source'),
-    ]
-}
-
-# A map of the DGNs that will be sent to both services
-COMMON_DGN_MAP = {
-    0x0EBFF: [
-        # Pulls the U3 firmware version (e.g., "2.14") if the current 0x0EBFF segment contains "U3:"  this is hardcoded at first
-        ('/FirmwareVersion',                        lambda d: None, '', 'A multi frame DGN that needs to be assembled'),
-    ],
-    0x1FEEB: [  # PRODUCT_IDENTIFICATION (duplicated)
-        ('/FirmwareVersion',                        lambda d: f"{safe_u8(d, 4)}.{safe_u8(d, 5)}",   '',      'Firmware major.minor'),
-        ('/ProductId',                              lambda d: safe_u16(d, 2),                       '',      'Numeric product identifier'),
-        ('/Mgmt/ManufacturerCode',                  lambda d: ((d[0] & 0x1F) | ((d[1] & 0xE0) << 3) | ((d[1] & 0x03) << 8)),     '',         '11-bit manufacturer code'),
-        # not included so we use the hard coded one.
-        #('/DeviceInstance',                         lambda d: safe_u8(d, 6),                        '',      'Device instance (node)'),        
-    ],
-    0x1FFDF: [  # INVERTER_GRID_DETECTION_STATUS
-        ('/Ac/Grid/Status',                         lambda d: safe_u8(d, 0),        '',      'Grid Detection Status Code'),
-        ('/Ac/Grid/PhaseAlignment',                 lambda d: safe_u8(d, 1),        '',      'Phase Match Indicator'),
-        ('/Ac/Grid/FaultFlags',                     lambda d: safe_u8(d, 2),        '',      'Grid Fault Flags'),
-    ],
-    0x1FFFD: [  # DC Source Status 1    # never see this one
-        ('/Dc/0/Instance',                          lambda d: safe_u8(d, 0),        '',      'DC Source Instance'),
-        ('/Dc/0/DevicePriority',                    lambda d: safe_u8(d, 1),        '',      'DC Source Device Priority'),
-        ('/Dc/0/Voltage',                           lambda d: safe_u16(d, 2, 0.05), 'V',     'DC Source Voltage'),
-        # DC Source Current  Expected on FEA3
-    ],
-    0x1FFCA: [  # CHARGER_AC_STATUS_1
-        ('/Ac/In/L1/V',              lambda d: safe_u16(d, 1, 0.05),                'V',     'AC Input L1 Voltage'),
-        ('/Ac/In/L1/I',              lambda d: u16_current(d, 3),                   'A',     'AC Input L1 Current'),
-        ('/Ac/In/L1/P',              lambda d: (None
-                                               if safe_u16(d, 1, 0.05) is None
-                                               or u16_current(d, 3)    is None
-                                               else round(safe_u16(d, 1, 0.05) * u16_current(d, 3), 1)),
-                                                                                    'W',     'AC Input L1 Power'),
-        ('/Ac/In/L1/F',              lambda d: safe_u16(d, 5, 1/128.0),             'Hz',    'AC Input L1 Frequency'),                                                                        
-        ('/Ac/ActiveIn/L1/V',        lambda d: safe_u16(d, 1, 0.05),                'V',     'Active AC Input L1 Voltage'),
-        ('/Ac/ActiveIn/L1/I',        lambda d: u16_current(d, 3),                   'A',     'Active AC Input L1 Current'),
-        ('/Ac/ActiveIn/L1/P',        lambda d: (None
-                                               if safe_u16(d, 1, 0.05) is None
-                                               or u16_current(d, 3)    is None
-                                               else round(safe_u16(d, 1, 0.05) * u16_current(d, 3), 1)),
-                                                                                    'W',     'Active AC Input L1 Power'),
-        ('/Ac/ActiveIn/L1/F',        lambda d: safe_u16(d, 5, 1/128.0),             'Hz',    'Active AC Input L1 Frequency'), 
-        ('/Ac/In/V',                 lambda d: safe_u16(d, 1, 0.05),                'V',     'AC Input Voltage (total)'),
-        ('/Ac/In/I',                 lambda d: u16_current(d, 3),                   'A',     'AC Input Current (total)'),
-        ('/Ac/In/Power',             lambda d: (None
-                                            if safe_u16(d, 1, 0.05) is None
-                                            or u16_current(d, 3) is None
-                                            else round(safe_u16(d, 1, 0.05) * u16_current(d, 3), 1)),
-                                                                                    'W',     'AC Input Power (total, apparent)'),
-        ('/Ac/In/F',                 lambda d: safe_u16(d, 5, 1/128.0),             'Hz',    'AC Input Frequency (total)'),
-        ('/Ac/ActiveIn/Power',       lambda d: (None
-                                            if safe_u16(d, 1, 0.05) is None
-                                            or u16_current(d, 3)    is None
-                                            else round(safe_u16(d, 1, 0.05) * u16_current(d, 3), 1)),
-                                                                             'W',  'Active AC Input Power (total, apparent)'),
-        ('/Ac/ActiveIn/Connected',   lambda d: (1 if (safe_u16(d, 1, 0.05) or 0) > 85.0 else 0), '',   'Active AC Input present'),
-    ],    
-    0x1FDA0: [  # DC_SOURCE_LOAD_CONTROL
-        ('/Dc/Source/LoadControl/Status',           lambda d: safe_u8(d, 0),        '',      'Load Control Status'),
-        ('/Dc/Source/LoadControl/Reason',           lambda d: safe_u8(d, 1),        '',      'Load Control Reason'),
-        ('/Dc/Source/LoadControl/TimeUntilRestart', lambda d: safe_u16(d, 2),       's',     'Time Until Restart'),
-        ('/Dc/Source/LoadControl/RetryCount',       lambda d: safe_u8(d, 4),        '',      'Retry Count'),
-        ('/Dc/Source/LoadControl/MaxRetries',       lambda d: safe_u8(d, 5),        '',      'Maximum Retries'),
-        ('/Dc/Source/LoadControl/Command',          lambda d: safe_u8(d, 6),        '',      'Load Control Command'),
-        ('/Dc/Source/LoadControl/Flags',            lambda d: safe_u8(d, 7),        '',      'Flags'),
-    ],
-    0x1FEDD: [  # INVERTER_TEMPERATURES
-        ('/Temp/Ambient',                           lambda d: safe_s16(d, 0, 1.0),  '°C',    'Ambient Temperature'),
-        ('/Temp/Board',                             lambda d: safe_s16(d, 2, 1.0),  '°C',    'Board Temperature'),
-        ('/Temp/InputFET',                          lambda d: safe_s16(d, 4, 1.0),  '°C',    'Input FET Temperature'),
-        ('/Temp/OutputFET',                         lambda d: safe_s16(d, 6, 1.0),  '°C',    'Output FET Temperature'),
-    ],
-    0x1FEBD: [  # INVERTER_TEMPERATURE_STATUS  (shared with Charger)
-        # does not seem to be send data for this 
-        #('/Temp/FET',                              lambda d: safe_s8(d, 1),        '°C',    'FET temperature'),
-        ('/Temp/Transformer',                       lambda d: safe_s8(d, 2),        '°C',    'Transformer temperature'),
-    ],
-    0x0E842: [  # INVERTER_TEMPERATURES  (shared with Charger)
-        ('/Temp/Transformer',                       lambda d: safe_s8(d, 1),        '°C',    'Transformer Temperature'),
-        ('/Temp/MOSFET',                            lambda d: safe_s8(d, 2),        '°C',    'MOSFET Temperature'),
-        ('/Temp/Heatsink',                          lambda d: safe_s8(d, 3),        '°C',    'Heatsink Temperature'),
-    ]
-}
+    # Define our NMEA transmit packet here 
+    # Fields without a 'value' key will pull from the function arguments
+    # Data types we support are: uint8, int8, uint16, int16, uint32, int32,
+    # string, and bytes
+    # ******************************************************************
+    # Note these inverter/charger control packets don't work yet.
+    # Still hoping for help from Xantrex Tech support.  These are based on
+    # info from the canboat reverse engineered NMEA data project
+    # ******************************************************************
+    TRANSMIT_PGN_MAP = {
+        'CONTROL_CHARGER': {                        # enable/disable charger packet
+            'PRI': 6,                               # priority 
+            'PGN': 0x1F216,                         # PGN
+            'FP': True,                             # is this a fast packet?
+            'DATA': {
+                'instance':                 {'type': 'uint8', 'value': 1},
+                'DC_instance':              {'type': 'uint8', 'value': 1},
+                'enable':                   {'type': 'uint8'},         # Variable (Param 1)
+                'charge_current_limit':     {'type': 'uint8', 'value': 100},  # percent 
+                'algorithm_mode':           {'type': 'uint8', 'value': 0}, 
+                'flags':                    {'type': 'uint8', 'value': 0}, 
+                'equalize_timet':           {'type': 'uint16', 'value': 0}, 
+            }                                          
+        },
+        'CONTROL_INVERTER': {                       # enable/disable inverter packet
+            'PRI': 6,                               # priority 
+            'PGN': 0x1F217,                         # PGN
+            'FP': True,                             # is this a fast packet?
+            'DATA': {
+                'instance':                 {'type': 'uint8', 'value': 1},
+                'AC_instance':              {'type': 'uint8', 'value': 2},
+                'DC_instance':              {'type': 'uint8', 'value': 1},
+                'enable':                   {'type': 'uint8'},         # Variable (Param 1)
+                'load_sense_threshold':     {'type': 'uint16', 'value': 25}, 
+                'load_sense_interval':      {'type': 'uint16', 'value': 200}, 
+            }                                          
+        },     
+        # This packet works as it should
+        'ACK_ALARM': {                              # send acknowledge packet 
+            'PRI': 6,                               # priority
+            'PGN': 0x1F008,                         # PGN
+            'FP': True,
+            'DATA': {
+                'response': {'type': 'bytes'},      # This will be a copy of the alarm packet received
+                'ack':      {'type': 'uint8'}       # This is the acknowledge type (silence, acknowledge) 
+            }
+        },
+    }    
 
 
-# DGNs required for derived power calculations
-# Only see FFCA and FEE8 in the logs so far.
-DERIVED_DGNS = {
-    0x1FFD6,  # AC-Out RMS (V, F)            – ensures /Ac/Out/V,F are fresh
-    0x1FFDD,  # AC-Out power summary         – total P, Q, S, PF
-    0x1FFCA,  # AC-In / Active-In L1 (V, I)  – feeds /Ac/In/L1/Power
-    0x1FFCC,  # DC-Bus voltage & current     – /Dc/0/Voltage, /Dc/0/Current
-    0x1FEE8   # Battery bank voltage/current – /Dc/1/Voltage, /Dc/1/Current
-}
-
-    #0x1FFD7,  # AC-Out L1 (V, I)             – drives /Ac/Out/L1/Power  /    FFD5 is returned so we use that instead
-
-
-
-# =============================================================================
-# EXTENSION: Add `.update()` support to VeDbusItemExport without monkeypatching
-# -----------------------------------------------------------------------------
-# Goal: Allow our code to call `.update({'unit': ..., 'description': ...})`
-#       on each D-Bus path we register.
-#
-# Problem: The default `vedbus.py` in Venus OS does NOT
-#          support `.update()` on the objects returned by add_path().
-#
-# Solution: We subclass both VeDbusItemExport and VeDbusService to safely
-#           introduce `.update()` support — cleanly and locally — without:
-#           ❌ modifying system vedbus.py
-#           ❌ monkeypatching global class methods
-# =============================================================================
-
-#  This class extends the D-Bus path object to support .update(meta)
-class VeDbusItemExportWithMeta(vedbus.VeDbusItemExport):
-    def __init__(self, path, initial_value=None, writeable=False, onchange=None):
-        # This ensures D-Bus internals like _locations are properly initialized
-        super().__init__(path, initial_value, writeable, onchange)
-        self.value = initial_value  # for decoder logic
-
-    
-    def update(self, meta: dict):
-        """
-        Allows setting additional metadata on the D-Bus path, such as:
-        - unit
-        - description
-        Mimics newer vedbus.py behavior (as seen in 3.6+ or GuiMods projects).
-        """
+    def __init__(self, can_address: int) -> None:
+        self._rx_fpa = {                        # used to store Fast Packet assembly metadata
+            'last_seq': 0,                      # last sequence number seen 
+            'bytes_remaining': 0,               # number of bytes remaining to assemble
+            'buf': [],                          # accumlator of all data bytes
+            'assembling': False,                # flag to indicate whether we're in the middle of things
+            }                       
+        self._rx_callback = None
+        self._our_address = can_address         # save our CAN ID
+        self._tx_fpa_sequence = 0               # transmit sequence number for fast packets
+        self._can_filters = []                  # list of CAN ID we accept
         
-        for key, value in meta.items():
-            setattr(self, key, value)
-
-
-#  This class overrides the default add_path() to use our extended object
-class VeDbusServiceWithMeta(vedbus.VeDbusService):
-    def __init__(self, servicename, bus, object_path=None):
-        # Initialize the parent VeDbusService class
-        super().__init__(servicename, bus, object_path)
-        
-        # Explicitly initialize exported_paths as a dictionary
-        self.exported_paths = {}    
-        
-        
-    def add_path(self, path, value=None, writeable=False, onchange=None, unit=None, description=None):
-        """
-        - Calls base method to create and register object
-        - Promotes to subclass to add .update() and .value
-        - Returns safe, fully initialized object
-        """
-
-        # Step 1: Register via base method (handles all D-Bus internals)
-        base_item = super().add_path(path, value, writeable, onchange)
-
-        # Step 2: Promote to subclass that supports .update()
-        item = VeDbusItemExportWithMeta.__new__(VeDbusItemExportWithMeta)
-        item.__dict__ = base_item.__dict__
-
-        # Step 3: Add decoding support
-        item.value = value
-
-        # Step 4: Attach optional metadata
-        # Prepare metadata dictionary from provided unit/description
-        meta = {}
-        if unit:
-            meta["unit"] = unit
-        if description:
-            meta["description"] = description
-
-        # If any metadata is provided, apply it via .update()
-        if meta:
-            item.update(meta)
-            
-        # Step 5: Store the item in exported_paths
-        self.exported_paths[path] = item
-
-        return item
-
-
-# === D-Bus Service Class ===
-class XantrexService:
-    def __init__(self, *, debug=False, verbose=False):
-        # Flags to control runtime logging behaviour
-        self.debug = debug
-        self.verbose = verbose
-
-        # Runtime counters and internal state
-        self.frame_count         = 0                 # Total CAN frames received
-        self.error_count         = 0                 # Total decode errors
-        self.loop                = None              # Reference to the GLib main loop        
-        self.last_heartbeat      = time.time()       # Timestamp of last valid frame received
-        self.last_dgn            = 0 
-        self.last_src            = 0
-        self.unmapped_seen       = set()             # DGNs we've seen but aren't in the DGN_MAPs
-        self.unmapped_counts     = {}                # Unmapped DGN => count of how many times it's seen
-        self.heartbeat_counter   = 0        
-        self.isthereaframe       = 0
-        
-        # Xantrex discovery (EE00)
-        # we should not be hard coding these values, but xantrex does not seem to respond to the request
-        self.xantrex_sources       = {0x42: 129}    #  D0 is victron for sure, let's see if we can just use xantrex data{0x42: 129, 0xD0: 128 }   # = inverter/charger; accept SA 0x42 from boot   /  dict: SA -> function (NAME byte 5)  store what is found from the EE00 addresses claimed request  D0 = inverter?
-        self.multiframe_assemblies = {}  # {sa: {"len","exp","got","seq","pgn","buf","deadline"}}
-        self.SA_toSkip             = set()
-        self.primary_source        = 0x42 # default to this as the primary Source address.  We will confirm this via a request for EE00    - do not seem to get a response to ee00
-        
-
-        logger.info(f"Initializing Xantrex Service on {CAN_INTERFACE}")
-
-        # This script creates two D-Bus services for the Xantrex Freedom Pro 3000, a single unit with inverter and charger functions:
-        # - com.victronenergy.inverter.can_xantrex: Inverter data (e.g., /Ac/Out/L1/Power)
-        # - com.victronenergy.charger.can_xantrex: Charger data (e.g., /Dc/0/Current)
-        # Both services share the same device instance (252) to indicate a single physical device.
-        self.inverter_bus = new_system_bus()
-        self.charger_bus  = new_system_bus()
-        
-        self._InverterService = VeDbusServiceWithMeta('com.victronenergy.inverter.can_xantrex', self.inverter_bus, '/com/victronenergy/inverter/can_xantrex' )        
-        self._ChargerService  = VeDbusServiceWithMeta('com.victronenergy.charger.can_xantrex',  self.charger_bus , '/com/victronenergy/charger/can_xantrex'  )        
-
-        
-        self._InverterService.descriptor = 'INVERTER'
-        self._ChargerService.descriptor  = 'CHARGER' 
-        
-        # Build one dispatch table, once at startup:
-        #    dgn → (dgn_items, dbus_paths)
-       
-        self._combined_dgns: dict[int, list[tuple[str, Any, str, str, dict[str, Any], Any]]] = {}
-        
-
-        for dgn, items in INVERTER_DGN_MAP.items():
-            flat = self._combined_dgns.setdefault(dgn, [])
-            for item in items:
-                if len(item) == 4: 
-                    path, decoder, unit, description = item
-                else:               
-                    path, decoder = item; unit, description = '', ''
-                flat.append((path, decoder, unit, description, self._InverterService.exported_paths, self._InverterService))
-
-        for dgn, items in CHARGER_DGN_MAP.items():
-            flat = self._combined_dgns.setdefault(dgn, [])
-            for item in items:
-                if len(item) == 4: 
-                    path, decoder, unit, description = item
-                else:
-                    path, decoder = item; unit, description = '', ''
-                flat.append((path, decoder, unit, description, self._ChargerService.exported_paths,  self._ChargerService))
-
-        for dgn, items in COMMON_DGN_MAP.items():
-            flat = self._combined_dgns.setdefault(dgn, [])
-            for item in items:
-                if len(item) == 4: 
-                    path, decoder, unit, description = item
-                else:               
-                    path, decoder = item; unit, description = '', ''
-                flat.append((path, decoder, unit, description, self._InverterService.exported_paths, self._InverterService))
-                flat.append((path, decoder, unit, description, self._ChargerService .exported_paths,  self._ChargerService))
-
-
-        # Precompute 5-digit uppercase hex strings for each DGN key
-        self._dgn_name_hints = { dgn: f"{dgn:05X}" for dgn in self._combined_dgns }
-
-
+        logger.info(f'Initializing NMEA 2000 Class on address: {can_address}')
+          
         # Validate, Open, and bind CAN socket
+        # We are using the Linux socketCAN driver here
+        # https://www.kernel.org/doc/Documentation/networking/can.txt
         try:
             if not os.path.exists(f'/sys/class/net/{CAN_INTERFACE}'):
                 logger.error(f"Interface {CAN_INTERFACE} not found in sysfs")
@@ -877,6 +387,7 @@ class XantrexService:
             logger.info("CAN receive buffer requested=%d, effective=%d (kernel reports doubled value)", RCVBUF_BYTES, effective)
             
             self.socket.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_LOOPBACK, 0)     # off → no echo generated at all
+
             self.socket.bind((CAN_INTERFACE,))
             logger.info(f"CAN socket bound to {CAN_INTERFACE}")
                 
@@ -887,423 +398,197 @@ class XantrexService:
                 logger.error(f"Permission denied: try running as root (EPERM)")
             else:
                 logger.error(f"Failed to bind CAN socket on {CAN_INTERFACE}: {e}")
-
             raise
 
-
-        # Register all known D-Bus paths defined in the DGN maps (structure only, no data decoding).
-        # This ensures all expected paths are visible in D-Bus tools (like dbus-spy) from startup,
-        # with correct metadata (unit and description), even before any CAN data is received.
-        
-        # ── Register DGN-maps paths ─────────────────────────────────────
-        for dgn, dgn_items in self._combined_dgns.items():
-            for item in dgn_items:  # (path, decoder, unit, description, dbus_paths, service)         
-                path, decoder, unit, description, dbus_paths, service = item
-
-                # Register the D-Bus path with placeholder value and metadata (if available)
-                self.register_path(service, path, None, writeable=False, unit=unit, description=description)
-
-
-
-        # Register /Mgmt/xantrex-can paths on both services
-        for svc in (self._InverterService, self._ChargerService):
-            self.register_path(svc, '/FirmwareVersion',         FIRMWARE_VERSION,       writeable=False, unit='', description='Firmware version of this driver')
-            self.register_path(svc, '/ProductId',               PRODUCT_ID,             writeable=False, unit='', description='Numeric product identifier')
-            self.register_path(svc, '/DeviceInstance',          DEVICE_INSTANCE,        writeable=False, unit='', description='Device instance number')
-            self.register_path(svc, '/Connected',               1,                      writeable=False, unit='', description='Service availability flag')
-            self.register_path(svc, '/Status',                  'initializing',         writeable=False, unit='', description='Driver state')
-            self.register_path(svc, '/Error',                   0,                      writeable=False, unit='', description='Error code')            
-            self.register_path(svc, '/Mgmt/ProcessAlive',       1,                      writeable=False, unit='', description='Standard heartbeat counter')
-            self.register_path(svc, '/Mgmt/LastUpdate',         '',                     writeable=False, unit='', description='Global heartbeat timestamp')
-            self.register_path(svc, '/Mgmt/ManufacturerCode',   119,                    writeable=False, unit='', description='Manufacturer code')            
-            self.register_path(svc, '/Mgmt/ProcessName',        'xantrex_rvc',          writeable=False, unit='', description='Process name')     
-            self.register_path(svc, '/Mgmt/ProcessVersion',     SCRIPT_VERSION,         writeable=False, unit='', description='')                 
-            self.register_path(svc, '/Mgmt/ProcessInstance',    0,                      writeable=False, unit='', description='')                             
-            self.register_path(svc, '/Mgmt/Connection',         f"CAN@{CAN_INTERFACE}", writeable=False, unit='', description='CAN interface binding')                                         
-            self.register_path(svc, '/Mgmt/Type',               'inverter' if svc is self._InverterService else 'charger', writeable=False, unit='', description='Device type')            
-
-
-
-        # Name is currently hard code mine.  
-        # Here is a list of xantrex series that support rv-c, all are inverter/charger units
-        # Freedom SW-RVC
-        # Freedom SW 
-        # Freedom XC Pro
-        # Freedom XC 
-        # Register additional derived D-Bus paths
-        # These are not mapped directly from DGNs but are calculated at runtime
-        # Example: /Dc/0/Power = /Dc/0/Voltage × /Dc/0/Current
-        # includes meta data units and description
-        # ────────────────────────────────────────────────────────────────
-        # Register derived D-Bus paths on inverter service (per line)
-        # ────────────────────────────────────────────────────────────────
-        self.register_path(self._InverterService, '/Ac/In/L1/Power',       None, writeable = False, unit = 'W', description = 'AC Input L1 Power')
-        self.register_path(self._InverterService, '/Ac/ActiveIn/L1/P',     None, writeable = False, unit = 'W', description = 'AC Active Input L1 Power')
-        self.register_path(self._InverterService, '/Ac/Out/L1/P',          None, writeable = False, unit = 'W', description = 'AC Output L1 Power')
-        self.register_path(self._InverterService, '/Ac/In/P',              None, writeable = False, unit = 'W', description = 'Total AC Input Power')
-        self.register_path(self._InverterService, '/Ac/In/I',              None, writeable = False, unit = 'A', description = 'Total AC Input Current')
-        self.register_path(self._InverterService, '/Ac/Out/P',             None, writeable = False, unit = 'W', description = 'Total AC Output Power')
-        self.register_path(self._InverterService, '/Ac/Out/I',             None, writeable = False, unit = 'A', description = 'Total AC Output Current')        
-        self.register_path(self._InverterService, '/System/Ac/P',          None, writeable = False, unit = 'W', description = 'System AC Power')
-        self.register_path(self._InverterService, '/System/Ac/I',          None, writeable = False, unit='A',   description = 'System AC Current')
-
-        # since we are Xantrex only L1 is supported, so I hardcoded these.  
-        self.register_path(self._InverterService, '/Ac/NumberOfInputs',        1,                         writeable=False, unit='', description='Number of AC Inputs')
-        self.register_path(self._InverterService, '/Ac/ActiveIn/ActiveInput',  0,                         writeable=False, unit='', description='Active AC Input index')
-        self.register_path(self._InverterService, '/Ac/ActiveIn/Source',       2,                         writeable=False, unit='', description='AC Input Source (0=Grid,1=Generator,2=Shore)')
-
-        self.register_path(self._InverterService, '/Dc/0/Power',               None,                      writeable = False, unit = 'W', description = 'DC Power Bank 0')
-        self.register_path(self._InverterService, '/Dc/Power',                 None,                      writeable = False, unit = 'W', description = 'DC Power ')        
-        self.register_path(self._InverterService, '/Dc/Instance',              0,                         writeable = False, unit = 'W', description = 'DC Power ')        
-        self.register_path(self._ChargerService,  '/Dc/0/Power',               None,                      writeable = False, unit = 'W', description = 'DC Power Bank 0')
-        self.register_path(self._ChargerService,  '/Dc/Power',                 None,                      writeable = False, unit = 'W', description = 'DC Power ')        
-        self.register_path(self._ChargerService,  '/Dc/Instance',              0,                         writeable = False, unit = 'W', description = 'DC Power ')        
-
-        self.register_path(self._InverterService, '/CustomName',     'XC Pro 3000 (Inverter)',            writeable=False, unit='',  description='Display device name in GUI.')
-        self.register_path(self._ChargerService,  '/CustomName',     'XC Pro 3000 (Charger)',             writeable=False, unit='',  description='Display device name in GUI.')
-      
-        # /ProductName is listed as a mandatory path for product services in the D-Bus API (along with /ProductId, /FirmwareVersion, /DeviceInstance, /Connected).
-        # This is what shows in the device list.
-        self.register_path(self._InverterService, '/ProductName',    'Freedom XC Pro (Inverter)',         writeable=False, unit='',  description='Display device name in GUI.')
-        self.register_path(self._ChargerService,  '/ProductName',    'Freedom XC Pro (Charger)',          writeable=False, unit='',  description='Display device name in GUI.')
-
-        self.register_path(self._InverterService, '/Ac/Out/Total/P', 0.0,                                 writeable=False, unit='W', description='Total Active Power')
-        self.register_path(self._InverterService, '/Ac/Out/Total/I', 0.0,                                 writeable=False, unit='A', description='Total Current')
-
-        self.register_path(self._InverterService, '/Ac/Grid/P',     None,                                 writeable=False, unit='W', description='Grid total active power (alias of /Ac/In/P)')
-        self.register_path(self._InverterService, '/Ac/Grid/I',     None,                                 writeable=False, unit='A', description='Grid total current (alias of /Ac/In/I)')
-
-        mode_item = self.register_path(self._InverterService, '/Mode',                 4, writeable = False,    unit = '',  description = 'Inverter Mode - Venus OS Switch?')   # “On” (normal/auto, charger + inverter available)
-        # Give it a text mapper so GUI shows "On"/"Off" instead of 3/4
-        mode_item._gettextcallback = (lambda _path, value: {1:"Charger only", 2:"Inverter only", 3:"Auto/On", 4:"Off"}.get(int(value), str(value)) )
-
         # Add socket listener to GLib event loop
-        self.watch_id = GLib.io_add_watch(self.socket.fileno(), GLib.IO_IN, self.handle_can_frame)
-
-        # Unit may be off now; but let's try
-        self.send_pgn_request(0x1EE00,  0xFF)   # Address Claimed
-        self.send_pgn_request(0x1FEEB,  0xFF)   # Product Identification
-        self.send_pgn_request(0x1FFDE,  0xFF)   # Inverter Model Info
-
-        # the unit maybe off or the primary address may not be the default and these never get sent.  For now I am ok with that.    
-        # This block sends request to the Xantrex for various info that the Venus OS GUI may display
-        #  Inverter-side operational data
-        self.send_pgn_request(0x1FFD7)   # Inverter AC Status 1 - /Ac/Out/L1/V I F, /State, output fault bits
-        self.send_pgn_request(0x1FFD4)   # Inverter Status (Mode, pass-through, load-sense)
-        self.send_pgn_request(0x1FFD5)   # Inverter Status 2 (overload / temp / warning flags)
-
-
-        #  Charger-side operational data  (decoded now, split service later)
-        self.send_pgn_request(0x1FFCA)   # Charger AC Status 1 → AC-in / Active-in L1 V & I
-        self.send_pgn_request(0x1FFC7)   # Charger Status Flags → charger state, enable flag, inverter-active bit
-
-        #  Identity / product information    - these do not seem to be sent back
-        self.send_pgn_request(0x1FFDE)   # Inverter Model Info     - /Info/Model, /Info/Serial, /Info/HardwareVersion
-        self.send_pgn_request(0x1FEEF)   # Software Identification - might be able to drop if no reply
-        self.send_pgn_request(0x0EBFF)   # firmware is in here and more.
-
-        # these do not seem to be sent back    
-        #self.send_pgn_request(0x1FFD6)   # Inverter AC Status 2 (aggregate RMS V & F)
-        #self.send_pgn_request(0x1FFDD)   # Inverter Power Summary (P, Q, S, PF)
-        #self.send_pgn_request(0x1FFCC)   # Inverter DC-bus Status (Voltage & Current)
-        #self.send_pgn_request(0x1FEEB)   # Product Identification  - FirmwareVersion, ProductId, ManufacturerCode, DeviceInstance
-
-        if self.verbose:
-            logger.info("Service initialization complete")
-            for path in sorted(self._InverterService.exported_paths):
-                logger.info(f"[REGISTERED][{self._InverterService.descriptor}] {path}")
-            for path in sorted(self._ChargerService.exported_paths):
-                logger.info(f"[REGISTERED][{self._ChargerService.descriptor}]  {path}")
-                
-        self._InverterService['/Status'] = 'ok'
-        self._ChargerService['/Status']  = 'ok'
-
-        self._InverterService['/State'] = 0   # prime the state as off.  If the unit is not on it will be correct.  If is on, it will be quickly updated.
-        self._ChargerService['/State']  = 0
-        
-
-
-
-    def register_path(self, service, path, value=None, writeable=False, unit=None, description=None):
-        
-        # Registers a D-Bus path on the given service with optional unit and description metadata.
-        # Compatible with vedbus.py on Venus OS 2.7+.
-        
-
-        # Only register once
-        if path not in service.exported_paths:
-            # Legacy call: name, value, writeable flag only - unit/description is not supported directly pre 3.5? somewhere in there.
-            item = service.add_path(path, value, writeable=writeable)
-
-            # Manually inject metadata for pre-3.6 compatibility
-            if unit is not None:
-                item.unit = unit
-            if description is not None:
-                item.description = description
-        else:
-            item = service.exported_paths[path]
+        self.watch_id = GLib.io_add_watch(self.socket.fileno(), GLib.IO_IN, self._rx_can_frame)
             
-            if value is not None:
-                service[path] = value       # → pushes to D-Bus  and <— ensure defaults overwrite earlier None
+    # This mehtod registers the callback for any CAN frames received.
+    def register_rx_callback(self, rx_cb_func) -> None:
+        self._rx_callback = rx_cb_func
 
-                logger.info(f"[register_path] '{path}' on service {service.descriptor}, updated.  value: {value!r} ")
-                
-            else:    
-                logger.info(f"[register_path] '{path}' already exists on {service.descriptor}, skipping creation.    value: {value!r}")
-                
-        return item
-    
-    # send a request to the unit
-    def send_pgn_request(self, pgn: int, global_request: bool = False) -> bool:
+    # This function adds a filter to the CAN driver.  The PGN passed to this
+    # function will be added to a list of PGNs that will be accepted and pass
+    # back tot he application.  The filter will accept the PGN from any source
+    # address and with any priority.
+    def add_can_filter(self, pgn: int) -> None:
+        PGN_MASK = 0x3FFFF00                    # Any source and any Priority
+
+        pgn = pgn << 8                          # shift into position above the src address
+        # Add the new filter to our local tracking list
+        self._can_filters.append((pgn, PGN_MASK))
+
+        # Pack the filters into a binary string
+        # Each filter is 2 unsigned 32-bit integers (8 bytes total)
+        # 'I' is for 32-bit unsigned int. We use '=' for standard alignment.
+        filter_data = b""
+        for f_id, f_mask in self._can_filters:
+            filter_data += struct.pack("=II", f_id, f_mask)
+
+        # Apply the updated list to the socket
         try:
-            da         = 0xFF if global_request else (self.primary_source & 0xFF)  # J1939 Request is PDU1 (PF=0xEA): PS is the Destination Address (DA).
-                                                                   # Use 0xFF for GLOBAL; otherwise unicast to the target at primary_source.
+            self.socket.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, filter_data)
+            logger.info(f"Filter added: ID 0x{pgn:X}. Total: {len(self._can_filters)}")
+        except OSError as e:
+            logger.error(f"Failed to set filters: {e}")
 
-            sa         = (self.primary_source & 0xFF)              # Source Address (SA) 
-                                                                   # Here we send from primary_source as well.
- 
-            can_id     = 0x18EA0000 | (da << 8) | sa               # 29-bit CAN ID: Priority=6 + PF=0xEA (Request) + PS=DA + SA.
-                                                                   # GLOBAL example: DA=0xFF, SA=0x42 → 0x18EAFF42; Unicast example: DA=0x42, SA=0x42 → 0x18EA4242.
+        
+    # send a request to the unit
+    def send_can_frame(self, pri: int, pgn: int, data: bytes ) -> bool:
+        try:
+            sa      = (self._our_address & 0xFF)                # Source Address (SA) 
+            can_id  = (pri << 26) | (pgn << 8) | sa             # 29-bit CAN ID: Priority + PGN + source address
+            can_id |= self.CAN_EFF_FLAG                         # mark this as a extended frame ID 
             
-            pgn_bytes  = struct.pack('<I', pgn)[0:3]               # Little-endian PGN, 3 bytes
-            data       = pgn_bytes + b'\xFF' * 5                   # Pad to 8 bytes
-            frame      = struct.pack("=IB3x", can_id, 8) + data    # Full CAN frame
+            # We need to format a C structure for the call to socket.send().  The structure has the format:
+            # struct can_frame {
+            #     canid_t can_id;  /* 32 bit CAN_ID + EFF/RTR/ERR flags */
+            #     __u8    can_dlc; /* frame payload length in byte (0 .. CAN_MAX_DLEN) */
+            #     __u8    __pad;   /* padding */
+            #     __u8    __res0;  /* reserved / padding */
+            #     __u8    __res1;  /* reserved / padding */
+            #     __u8    data[8] __attribute__((aligned(8)));
+            # };
+            frame      = struct.pack("=IB3x", can_id, len(data)) + data    # Full CAN frame
+        
+            self.socket.send(frame)
 
-            # it has errorred, let's just retry 5 times before giving up.  not a big deal 
-            for attempt in range(6):
-                try:
-                    self.socket.send(frame)
-            
-                    logger.info(f"Sent PGN request for 0x{pgn:05X}")
-                    return True
-                except OSError as e:
-                    if attempt < 6:
-                        time.sleep(0.05 )
-                        continue
-                        
-                    return False
+            logger.info(f"Sent CAN frame 0x{pgn:05X}")
+            return True
+
         except Exception as e:
-            logger.error(f"Failed to send PGN request 0x{pgn:05X}: {e}")
+            logger.error(f"Failed to send CAN frame 0x{pgn:05X}: {e}")
+            return False
+                  
+    # This method breaks a larger packet into multiple frames
+    # using the NMEA "Fast Frame Format".  It directly transmits the frames as
+    # they are built.  Note: some NMEA Fast-packet frames payloads will still
+    # fit into a single CAN packet, but they need to be sent as FP.  So we
+    # assume that the shortest allowable packet is one where there are actually
+    # some payload bytes in the second frame (i.e. shortest = 6 bytes)
+    def send_fast_packet(self, pri: int, pgn: int, payload: bytes) -> bool:
+        if len (payload) > 6:
+            idx = 0                             # index into the payload packet
+            self._tx_fpa_sequence += 1           # use the next sequence number
+            seq = ((self._tx_fpa_sequence) << 4) & 0xff   # sequence number goes into the upper nibble in a local copy
+            data = bytearray (8)                # allocate our packet
+            
+            # send first CAN frame
+            data[0] = seq                       # sequence number goes into first byte
+            data[1] = len (payload)             # payload length into the second byte
+            data[2:8] = payload[:6]             # first 6 bytes
+            self.send_can_frame (pri, pgn, data)
 
-
- 
-    # Format CAN frame for logging
-    def format_can_frame(self, dgn, dlc, data):
-        hexdata = ' '.join(f'{b:02X}' for b in data)
-        return f"DGN=0x{dgn:05X} | DLC={dlc} | Data={hexdata}"
-
-    
-    # Calculate power values from voltage and current paths
-    def update_derived_values(self):
+            remaining_data = payload[6:]
+            # Process the rest in chunks of 7
+            # If the last chunk is shorter than 7 (uneven), slicing handles it naturally
+            for i in range(0, len(remaining_data), 7):
+                seq += 1
+                data = bytearray(b'\xff' * 8)   # pad with 0xFF
+                data[0] = seq
         
-        # Triggered whenever we receive a PGN listed in DERIVED_DGNS.
-        # • Recomputes V×I power for individual measurement points
-        # • Sums AC totals (input / output) and mirrors them to aliases
-        # compute and publish P = V × I for inverter service
-        def compute_power(dst_path: str, v_path: str, c_path: str) -> None:
-            try:
-                # Fetch the source D-Bus items
-                v_item = self._InverterService.exported_paths.get(v_path)
-                c_item = self._InverterService.exported_paths.get(c_path)
-
-                # Skip if missing/placeholder ([], None). Zeros are OK.
-                if (v_item is None or c_item is None or v_item.value in (None, [])) or (c_item.value in (None, [])):
-                    return
-
-                # Calculate and publish power
-                p = round(v_item.value * c_item.value, 1)
-                self._InverterService[dst_path] = p
-
-                logger.info(f"[{self.frame_count:06}] [DERIVED - COMPUTE POWER] PGN=0x{self.last_dgn:05X} SRC=0x{self.last_src:02X} DERIVED {dst_path}={p:.1f} W (V={v_item.value} V × I={c_item.value} A)")
-
-            except Exception as e:      # Full traceback only when debug flag set
-                if self.debug:
-                    logger.exception(f"[{self.frame_count:06}] [DERIVED FAIL ] PGN=0x{getattr(self,'last_dgn',0):05X} SA=0x{getattr(self,'last_src',0):02X} {dst_path} – {e}")
-
-
-        #  AC totals for single-phase (L1) group
-        def compute_totals(base_path: str, aliases: list[str] | None = None) -> None:
-            try:
-                v_item = self._InverterService[f"{base_path}/L1/V"]
-                c_item = self._InverterService[f"{base_path}/L1/I"]
-
-                if v_item is None or c_item is None:   #or v_item == 0.0 or c_item == 0.0:   Allow 0 to be displayed
-                    return
-
-                # Aggregate; Freedom XC has only one phase
-                p_total = round(v_item * c_item, 1)
-                i_total = round(c_item, 1)
-
-                # Write to canonical total paths
-                self._InverterService[f"{base_path}/P"] = p_total
-                self._InverterService[f"{base_path}/I"] = i_total
-
-                # Mirror onto any alias prefixes (e.g. /Ac/Grid, /System/Ac)
-                if aliases:
-                    for alias in aliases:
-                        self._InverterService[f"{alias}/P"] = p_total
-                        self._InverterService[f"{alias}/I"] = i_total
-
-                logger.info(f"[{self.frame_count:06}] [DERIVED - TOTALS] PGN=0x{getattr(self,'last_dgn',0):05X} SA=0x{getattr(self,'last_src',0):02X} DERIVED {base_path} P={p_total:.1f} W I={i_total:.1f} A (L1)")
+                chunk = remaining_data[i : i + 7]
+                data[1 : 1 + len(chunk)] = chunk 
+                self.send_can_frame (pri, pgn, data)
                 
-
-            except Exception as e:
-                if self.debug:
-                    logger.exception(f"[{self.frame_count:06}] [DERIVED TOTALS FAIL ]PGN=0x{getattr(self,'last_dgn',0):05X} SA=0x{getattr(self,'last_src',0):02X}{base_path} – {e}")
-
-
-        # Individual power paths (DC & AC) – single-phase Freedom XC
-        compute_power('/Dc/0/Power',       '/Dc/0/Voltage',     '/Dc/0/Current')
-        compute_power('/Dc/Power',         '/Dc/0/Voltage',     '/Dc/0/Current')        
-
-        # these are in the decoder blocks, a bit more efficient maybe.
-        #compute_power('/Ac/In/L1/P',       '/Ac/In/L1/V',       '/Ac/In/L1/I')
-        #compute_power('/Ac/ActiveIn/L1/P', '/Ac/ActiveIn/L1/V', '/Ac/ActiveIn/L1/I')
-        #compute_power('/Ac/Out/L1/P',      '/Ac/Out/L1/V',      '/Ac/Out/L1/I')
-
-        # Totals + aliases  (/Ac/In → /Ac/Grid ,  /Ac/Out → /System/Ac)
-        compute_totals('/Ac/In',   aliases=['/Ac/Grid'])
-        compute_totals('/Ac/Out',  aliases=['/Ac/Out/Total'])        
-        #compute_totals('/Ac/Out', aliases=['/System/Ac'])
-
-
-
-    def process_multiFrames(self, dgn: int, src: int, data: bytes) -> bool:
-        #  - ECFF (TP.CM/BAM announce) → start assembler
-        #  - EBFF (TP.DT data)         → append, finish, classify
-        # On completion: if payload text lacks 'XANTREX', add SA to SA_toSkip.
-        # Returns True when the frame was handled here.
-        # Fast drop: already known non-Xantrex TP traffic
-        
-        if dgn in (0x0ECFF, 0x0EBFF) and src in self.SA_toSkip:
-            logger.info(f"[MULTI FRAME PROCESSOR] SA=0x{src:02X} DGN=0x{dgn:05X} Skip=1")
             return True
+        else:
+            return False
 
-        # ----- ECFF (TP.CM/BAM) -----
-        if dgn == 0x0ECFF:
-            # Only BAM (0x20); ignore RTS/CTS/ABORT in this lean path
-            if len(data) < 8 or data[0] != 0x20:
-                logger.info(f"[MULTI FRAME PROCESSOR] SA=0x{src:02X} DGN=0x{dgn:05X} Skip=2")
-                return True
+    # This method sends a NMEA packet defined above.  Optional parameters will
+    # need to be passed if the packet format requires them
+    def send_nmea_message(self, pkt_key, *args):
+        tx_pkt = self.TRANSMIT_PGN_MAP[pkt_key]
+        if (tx_pkt):
+            packed_data = bytearray()
+            arg_list = list(args)
+            arg_idx = 0
+            # '<' ensures Little-Endian (Standard for most modern hardware)
+            ENDIAN = "<"
 
-            # Start (or reset) assembler for this SA
-            self.multiframe_assemblies[src] = {
-                "len": int.from_bytes(data[1:3], "little"),  # total bytes announced
-                "need": data[3],                              # number of TP.DT packets to expect
-                "seq": 1,                                     # next expected TP.DT sequence number
-                "pgn": int.from_bytes(data[5:8], "little"),   # target PGN being transported
-                "buf": bytearray(),                           # accumulator (7 bytes per DT)
-                "deadline": time.monotonic() + 2.0,           # simple timeout (seconds)
-            }
-            st = self.multiframe_assemblies[src]
-            logger.info(f"[MULTI FRAME PROCESSOR] SA=0x{src:02X} PGN=0x{st['pgn']:06X} LEN={st['len']} PKTS={st['need']}" )
-            return True
+            pri = tx_pkt.get ("PRI")
+            pgn = tx_pkt.get ("PGN")
+            fast_packet = tx_pkt.get ("FP")
+            
+            for key, spec in tx_pkt["DATA"].items():
+                data_type = spec.get("type")
 
-        # ----- EBFF (TP.DT) -----
-        if dgn == 0x0EBFF:
-            if src not in self.multiframe_assemblies:
-                logger.info(f"[MULTI FRAME PROCESSOR] SA=0x{src:02X} DGN=0x{dgn:05X} Skip=3")
-                return True
-            st = self.multiframe_assemblies[src]
-
-            # Timeout cleanup (lost DTs / stalled transfer)
-            if time.monotonic() > st["deadline"]:
-                logger.warning(f"[{self.frame_count:06}] [MULTI FRAME PROCESSOR TIMEOUT] SA=0x{src:02X} | DGN=0x{dgn:05X} | NEED={st['need']} | ACTION=Assembler dropped")
-                del self.multiframe_assemblies[src]
-                return True
-
-            # Require seq + at least 1 data byte
-            if len(data) < 2:
-                logger.info(f"[{self.frame_count:06}] [MULTI FRAME PROCESSOR DROP] SA=0x{src:02X} | DGN=0x{dgn:05X} | REASON=short-dt | LEN={len(data)} | DATA=[{data.hex(' ').upper()}]")
-                del self.multiframe_assemblies[src]
-                return True
-
-            # Enforce in-order DT sequence
-            if data[0] != st["seq"]:
-                logger.warning(f"[{self.frame_count:06}] [MULTI FRAME PROCESSOR SEQ] SA=0x{src:02X} | DGN=0x{dgn:05X} | EXP={st['seq']} | GOT={data[0]} | ACTION=Assembler dropped")
-                del self.multiframe_assemblies[src]
-                return True
-
-            # Append 7 data bytes and advance counters/deadline
-            st["buf"] += data[1:8]
-            st["seq"] += 1
-            st["need"] -= 1
-            st["deadline"] = time.monotonic() + 2.0
-              
-            try:
-                # Finished this BAM?
-                if st["need"] == 0:
-                    payload = bytes(st["buf"])[: st["len"]]  # trim to announced len
-                    pgn     = st["pgn"]
-                    del self.multiframe_assemblies[src]
-
-
-                    txt_raw = payload.decode("ascii", "ignore").strip("\x00 ").strip()
-                    txt_up  = txt_raw.upper() 
-
-                    # sanitize non-printables for log visibility 
-                    assembled_txt = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in txt_raw)                
-                
-                    if "XANTREX" in txt_up:
-                        if src not in self.xantrex_sources:
-                            # mark SA as Xantrex 
-                            self.xantrex_sources[src] = 129   #  inverter / charger
-                        
-                        #  we hard code the version to the latest.  If and when the dgn comes in, set the path correctly    
-                        # search the *entire* assembled string for a firmware pattern.
-                        # re.search(pattern, string) -> re.Match | None
-                        #   • pattern: r'U3:0*([0-9]{1,2}\.[0-9]{2})'
-                        #       - 'U3:'        literal prefix before the version token
-                        #       - '0*'         zero or more leading zeros (accepts U3:02.14 and U3:2.14)
-                        #       - '([0-9]{1,2}\.[0-9]{2})'  CAPTURE GROUP #1:
-                        #           · one–two digits, a dot, then exactly two digits → e.g. "2.14", "12.34"
-                        #   • string: assembled_txt (ASCII reconstructed from the multi-frame payload)
-                        # RETURNS:
-                        #   - re.Match (type: <class 're.Match'>) when found; access the version text via .group(1) (type: str)
-                        #     · .group(0) is the full match (e.g., "U3:02.14"); .span()/.start()/.end() give positions
-                        #   - None when not found
-
-                        temp = re.search(r'U3:0*([0-9]{1,2}\.[0-9]{2})', assembled_txt)
-                        if temp is not None:
-                            FIRMWARE_VERSION = temp.group(1)
-                            self._InverterService['/FirmwareVersion'] = FIRMWARE_VERSION   
-                            self._ChargerService['/FirmwareVersion']  = FIRMWARE_VERSION   
-                    
-                        logger.info(f"[{self.frame_count:06}] [MULTI FRAME PROCESSOR DONE] SA=0x{src:02X} | DGN=0x{dgn:05X} | PGN=0x{pgn:06X} | BYTES={len(payload)} | ASSEMBLED={assembled_txt} | NAME=XANTREX")
+                # Determine if we use the static value or a passed parameter
+                if "value" in spec:
+                    value = spec["value"]
+                else:
+                    if arg_idx < len(arg_list):
+                        value = arg_list[arg_idx]
+                        arg_idx += 1
                     else:
-                        # classify as not Xantrex
-                        self.SA_toSkip.add(src)
-                        logger.info(f"[{self.frame_count:06}] [MULTI FRAME PROCESSOR DONE] SA=0x{src:02X} | DGN=0x{dgn:05X} | PGN=0x{pgn:06X} | BYTES={len(payload)} | ASSEMBLED={assembled_txt} | NAME=OTHER → SA_toSkip")
-                        
-            except Exception as e:    
-                if self.debug:
-                    logger.exception(f"[{self.frame_count:06}] [ASSEMBLED FAIL ] PGN=0x{getattr(self,'last_dgn',0):05X} SA=0x{getattr(self,'last_src',0):02X} {dst_path} – {e}")
+                        raise ValueError(f"Missing parameter for variable field: {key}")
 
+                if data_type == "uint8":
+                    packed_data.extend(struct.pack(f"{ENDIAN}B", value))
+                elif data_type == "int8":
+                    packed_data.extend(struct.pack(f"{ENDIAN}b", value))
+                elif data_type == "uint16":
+                    packed_data.extend(struct.pack(f"{ENDIAN}H", value))
+                elif data_type == "int16":
+                    packed_data.extend(struct.pack(f"{ENDIAN}h", value))
+                elif data_type == "uint32":
+                    packed_data.extend(struct.pack(f"{ENDIAN}I", value))
+                elif data_type == "int32":
+                    packed_data.extend(struct.pack(f"{ENDIAN}i", value))
+                elif data_type == "string":
+                    encoded = value.encode('utf-8')
+                    packed_data.extend(struct.pack(f"{len(encoded)}s", encoded))
+                elif data_type == "bytes":
+                    packed_data.extend(value)
+                else:
+                    raise TypeError(f"Unsupported data type: {data_type}")
+
+            # now transmit the frame depending on the frame type
+            if fast_packet:
+                return self.send_fast_packet (pri, pgn, packed_data)
+            else:                   
+                return self.send_can_frame (pri, pgn, packed_data)
+        else:
+            logger.error(f"Unknown transmit packet key {pkt_key}:")
             
 
-            return True
+    # Only CAN frames that are declared part of a multiple frame message will
+    # be passed to this function
+    def AssembleFastPacket (self, data: bytes) -> tuple [bool, bytes]:
+        # LS nibble of the first byte will always be zero
+        if data[0] & 0x0f == 0:
+            self._rx_fpa["last_seq"] = data[0]
+            self._rx_fpa["bytes_remaining"] = data[1] - 6
+            self._rx_fpa["buf"] = bytearray(data[2:8])
+            self._rx_fpa["assembling"] = True        
+        else:                          
+            # are we still assembling and is the sequence number match what we
+            # expect
+            if self._rx_fpa["assembling"] and (self._rx_fpa["last_seq"] + 1) == data[0]:
+                self._rx_fpa["last_seq"] = data[0]
+                bytes = self._rx_fpa["bytes_remaining"]
+                bytes_to_copy = min(7, bytes) 
+                self._rx_fpa["buf"] += data[1:(bytes_to_copy + 1)]      
+                self._rx_fpa["bytes_remaining"] -= bytes_to_copy
+                if (bytes <= 7):                # we're on the last packet
+                    self._rx_fpa["assembling"] = False
+                    return True, self._rx_fpa["buf"]
+                    
+        return False, []            
+            
+    # Format CAN frame for logging
+    def format_can_frame(self, PGN, data):
+        hexdata = ' '.join(f'{b:02X}' for b in data)
+        return f"PGN=0x{PGN:05X} | DLC={len(data)} | Data={hexdata}"
 
-        # Not a Multi Frame PGN
-        return False
- 
-
-    # Process a single incoming CAN frame, decode its RV-C data, and update D-Bus paths.
+    # Process a single incoming CAN frame, decode its NMEA data, and update D-Bus paths.
     # Args:
     #    source: File descriptor of the CAN socket.
     #    condition: GLib IO condition (e.g., GLib.IO_IN).
     # Returns:
     #    bool: True to continue processing, False to stop.
 
-    def handle_can_frame(self, source, condition):
-        self.frame_count += 1
-        
-        processed    = 0
-        unchanged    = 0
-        skipped_none = 0
-        errors       = 0
-        
-        
-        
+    def _rx_can_frame(self, source, condition):
         # === Extract and Decode CAN ID and Data ===
         try:
             # Receive and Parse a J1939/RV-C CAN Frame ===
@@ -1321,286 +606,408 @@ class XantrexService:
             # Use available data, even if less than DLC  
             available_dlc = min(can_dlc, len(frame) - 8)
             if available_dlc == 0:
-                self.error_count += 1
-                logger.warning(f"[{self.frame_count:06}] [NO DATA] Frame=0x{can_id:08X} | DGN=0x{(can_id & 0x1FFFF) >> 8:05X} | DLC={can_dlc} | No data bytes available")
+                logger.warning(f"[NO DATA] Frame=0x{can_id:08X} | PGN=0x{(can_id & 0x1FFFF) >> 8:05X} | DLC={can_dlc} | No data bytes available")
                 return True            
                 
             # Slice out the actual CAN data payload (up to 8 bytes)
             data = memoryview(frame[8:8 + available_dlc])
 
             
-            # === Decode CAN ID into J1939 / RV-C fields ===
-            # According to J1939 (and RV-C which is built on top of it), a 29-bit CAN ID has:
+            # === Decode CAN ID into J1939 / NMEA fields ===
+            # According to J1939, a 29-bit CAN ID has:
             #
             #   | Priority (3) | Reserved (1) | Data Page (1) | PDU Format (8) | PDU Specific (8) | Source Address (8) |
             #     <-----------  bits 26–28  -> <-------- bits 24–25, 16–23, 8–15 ----------> <----- bits 0–7 --------->
             #
             # PGN (Parameter Group Number) spans bits 8–25 = 18 bits
             # SRC (SouRCe Address) = bits 0–7
-            # In RV-C, DGN == PGN (DGN = Diagnostic Group Number)
             pgn = (can_id >> 8) & 0x3FFFF   # Extract PGN from bits 8–25 (18 bits)
             src = can_id & 0xFF             # Extract Source Address from bits 0–7
-            dgn = pgn                       # In RV-C, the DGN is just the PGN
-            
 
+            logger.debug(f"[CAN ID] 0x{can_id:08X} → PGN=0x{pgn:05X} SRC=0x{src:02X} DLC={can_dlc} DATA=[{data.hex(' ').upper()}]")
 
-            # Find Xantrex sources from NAME (EE00) - Claims
-            if (dgn == 0x1EE00) or (dgn == 0x00EE00):
-                if len(data) >= 8:
-                    
-                    # Manufacturer = ((b2>>5) | (b3<<3)) & 0x7FF   ; Function = byte 5
-                    mfg = ((data[2] >> 5) | (data[3] << 3)) & 0x7FF
-                    if mfg == 119:  # Xantrex
-                        func = data[5]
-                        
-                        if src not in self.xantrex_sources:
-                            self.xantrex_sources[src] = func
-                            logger.debug(f"[{self.frame_count:06}] [CAN ID] 0x{can_id:08X} → PGN=0x{pgn:05X} DGN=0x{dgn:05X} SRC=0x{src:02X} DLC={can_dlc} DATA=[{data.hex(' ').upper()}]")
-                            logger.info(f"[{self.frame_count:06}] [XANTREX SOURCE FOUND] SA=0x{src:02X} function=0x{func:02X}" )
-                return True
-            else:
-                # if sources are not yet set, send the request 
-                # if we are here, income data, if this is not set, most likely the first time.
-                if not self.xantrex_sources:   # hard coding the sources for now...
-                    self.send_pgn_request(0x00EE00, 0xFF)   # Address Claimed
-                    #self.send_pgn_request(0x1FEEB,  0xFF)   # Product Identification
-                    #self.send_pgn_request(0x1FFDE,  0xFF)   # Inverter Model Info
-                    
-                    #logger.info(f"[{self.frame_count:06}] [XANTREX SOURCE REQUEST] 0x{can_id:08X} → PGN=0x{pgn:05X} DGN=0x{dgn:05X} SRC=0x{src:02X} DLC={can_dlc} DATA=[{data.hex(' ').upper()}]")
-                    
-                    #continue #processing the frame.            
-                else:
-                    if self.xantrex_sources and (src not in self.xantrex_sources):
-                        logger.info(f"[{self.frame_count:06}] [CAN ID - SOURCE SKIPPED] 0x{can_id:08X} → PGN=0x{pgn:05X} DGN=0x{dgn:05X} SRC=0x{src:02X} DLC={can_dlc} DATA=[{data.hex(' ').upper()}]")
-                        return True
-       
-            self.isthereaframe = 1    # set this to know the unit is on vs off, this will catch if it is turned off.
-            
-            logger.debug(f"[{self.frame_count:06}] [CAN ID] 0x{can_id:08X} → PGN=0x{pgn:05X} DGN=0x{dgn:05X} SRC=0x{src:02X} DLC={can_dlc} DATA=[{data.hex(' ').upper()}]")
-            if dgn in (0x0ECFF, 0x0EBFF):
-                if self.process_multiFrames(dgn, src, data):
-                    return True # consumed
-
-            #******** comment out this skipping of the DGNs which we did to do manually setting of the /State to give our decoder changes a chance       *****
-
-            # a charger value but if the volts is 0 throw the complete frame away    
-            #elif dgn == 0x1FFCA:   
-            #    v = safe_u16(data, 1, 0.05)   # AC In L1 Voltage
-            #    if v is None  or v <= 90:  #  when is is not charging the voltage is 0 but let's expand the capture
-            #        logger.info(f"[{self.frame_count:06}] [CAN ID - FFCA SKIPPED/BAD VOLTAGE] 0x{can_id:08X} → PGN=0x{pgn:05X} DGN=0x{dgn:05X} SRC=0x{src:02X} DLC={can_dlc} VOLTAGE={v}  DATA=[{data.hex(' ').upper()}]")                    
-            #        return True # consumed
-            #elif dgn == 0x1FFC7:   #  skip setting the state from this dgn if no voltage in.
-            #    if (self._ChargerService['/Ac/In/L1/V'] or 0) == 0:
-            #        logger.info(f"[{self.frame_count:06}] [CAN ID - FFC7 SKIPPED/NO VOLTAGE] 0x{can_id:08X} → PGN=0x{pgn:05X} DGN=0x{dgn:05X} SRC=0x{src:02X} DLC={can_dlc} DATA=[{data.hex(' ').upper()}]")                                        
-            #        return True # consumed
-
-            
-        except (OSError, ValueError) as e:
-            self.error_count += 1
-            if self.debug:
-                logger.error(f"[RECV ERROR] Failed to read from CAN socket: {e}")
+            # call the registered handler for this frame
+            if self._rx_callback:
+                self._rx_callback(pgn, src, can_dlc, data)
             return True
-            
-        # Look up this DGN in our pre-built map.
-        dgn_items = self._combined_dgns.get(dgn)
+
+        except (OSError, ValueError) as e:
+            logger.error(f"[RECV ERROR] Failed to read from CAN socket: {e}")
+            return True
+
+
+
+# === D-Bus Service Class ===
+class XantrexService:
+    def __init__(self):
+        self.known_alarms = [ 2, 3 ]            # temporary to help flush out unknown alarm codes
+        self.unknown_alarm_logged = []          # which alarms have we already captured
         
-        #  the frame id/DGN was not found
-        if dgn_items is None:            # -------------------- Unknown DGN --------------------
-            # If DGN is not recognized, log once and ignore            
-            
-            self.unmapped_counts[dgn] = self.unmapped_counts.get(dgn, 0) + 1
+        # === PGN Map: Decoders from NMEA PGNs to D-Bus paths ===
+        # Format: PGN : [(dbus_path, decode_function), ...]
+        # Each PGN (Diagnostic Group Number) corresponds to a specific NMEA data packet
+        # The lambda decoders extract meaningful values (voltage, current, state, etc.) from the binary payload
+        # Units and scaling factors are defined by the NMEA specification or device-specific implementation
 
-            if dgn not in self.unmapped_seen:
-                hex_data = ' '.join(f"{b:02X}" for b in data)
-                try:
-                    ascii_data = data.decode('ascii')
-                    if not all(32 <= ord(c) <= 126 for c in ascii_data):
-                        ascii_data = "<non-printable>"
-                except Exception:
-                    ascii_data = "<non-ascii>"
-                    
-                logger.info(f"[{self.frame_count:06}] [UNMAPPED] Frame=0x{can_id:08X} | DGN=0x{dgn:05X} | DLC={can_dlc} | Data=[{hex_data}] | ASCII='{ascii_data}'")
-                self.unmapped_seen.add(dgn)
+        # ─────────────────────────────────────────────────────────────────────────────
+        #  INVERTER_PGN_MAP  
+        # ─────────────────────────────────────────────────────────────────────────────
+        self.INVERTER_RX_PGN_MAP = {
+            # PGN 127750 - Converter Status
+            0x1F306: {  
+                'Fast_Packet': False,
+                'SPNs' : [  
+                    ('/State',                     lambda d: INV_CHG_STATE.get(int(safe_u8(d, 2) or 0), 0),    '',     'Charger operating state'),
+                ]
+            },
+            # PGN 130900 - Xantrex Proprietary packet
+            0x1FF54: {
+                'Fast_Packet': True,
+                'SPNs': [
+                    # AC input values
+                    ('/Ac/In/L1/V',                lambda d: safe_s16(d, 5, 0.01)  if d[2] == 1 else None,     'V',     'AC Input Voltage'),
+                    ('/Ac/In/L1/I',                lambda d: safe_s16(d, 7, 0.1)   if d[2] == 1 else None,     'A',     'AC Input L1 Current'),
+                    ('/Ac/In/L1/F',                lambda d: safe_u16(d, 9, 0.01)  if d[2] == 1 else None,     'Hz',    'AC Input Frequency'),
+
+                    # AC output values
+                    ('/Ac/Out/L1/V',               lambda d: safe_s16(d, 5, 0.01)  if d[2] == 2 else None,     'V',     'AC Output Voltage'),
+                    ('/Ac/Out/L1/I',               lambda d: safe_s16(d, 7, 0.1)   if d[2] == 2 else None,     'A',     'AC Output L1 Current'),
+                    ('/Ac/Out/L1/F',               lambda d: safe_u16(d, 9, 0.01)  if d[2] == 2 else None,     'Hz',    'AC Output Frequency'),
+                    ('/Ac/Out/L1/P',               lambda d: safe_u32(d, 11)       if d[2] == 2 else None,     'W',     'AC Output Real Power'),
+                ]                                                                                                                         
+            },
+            # PGN 126983 Alert
+            0x1F007: {
+                'Fast_Packet': True,
+                'SPNs': [  
+                ('/Alarms/LowVoltage',             lambda d: self.alarm(d) if d[3] == 2 else None,   '',     'Low Battery Voltage Alarm'),
+                ('/Alarms/HighVoltage',            lambda d: self.alarm(d) if d[3] == 3 else None,   '',     'High Battery Voltage Alarm'),
+
+                # These are stubbed out - hope one day to find out what the
+                # codes are for them
+                ('/Alarms/HighTemperature',        lambda d: self.unknown_alarm(d) if d[3] not in self.known_alarms else None,   '',     'Inverter over temperature'),
+                ('/Alarms/Overload',	           lambda d: self.unknown_alarm(d) if d[3] not in self.known_alarms else None,   '',     'Inverter output overloaded'),
+                ]
+            },
+            # PGN 127508 Battery Status
+            0x1F214: {
+                'Fast_Packet': False,
+                'SPNs': [  
+                ('/Dc/0/Voltage',                  lambda d: safe_u16(d, 1, 0.01),     'V',     'DC Battery Voltage'),
+                ]
+            },
+            # PGN 127751 - DC Voltage/Current
+            0x1F307: {
+                'Fast_Packet': False,
+                'SPNs': [  
+                ('/Dc/0/Current',                  lambda d: safe_s24(d, 4, 0.01),    'A',     'DC Inverter/Charger Current'),
+                ]
+            }
+        }
+
+
+        # Runtime counters and internal state
+        self.frame_count         = 0            # Total CAN frames received
+        self.error_count         = 0            # Total decode errors
+        self.loop                = None         # Reference to the GLib main loop        
+        self.last_heartbeat      = time.time()  # Timestamp of last valid frame received
+        self.heartbeat_counter   = 0            
+        self.isthereaframe       = 0            
+        
+        logger.info(f"Initializing Xantrex Service on {CAN_INTERFACE}")
+
+        # This script creates a D-Bus service for the Xantrex Freedom Pro, a single unit with inverter and charger functions:
+        self.system_bus = new_system_bus()
+        self._InverterService = vedbus.VeDbusService('com.victronenergy.inverter.can_xantrex', bus=self.system_bus, register=True)
+        self._InverterService.descriptor = 'INVERTER/CHARGER'
+                                    
+        # Register all known D-Bus paths defined in the PGN maps (structure only, no data decoding).
+        # This ensures all expected paths are visible in D-Bus tools (like dbus-spy) from startup,
+        # with correct metadata (unit and description), even before any CAN data is received.
+                          
+        # ── Register PGN-maps paths ─────────────────────────────────────
+        for PGN, PGN_items in self.INVERTER_RX_PGN_MAP.items():
+            for item in PGN_items['SPNs']:  # (path, decoder, unit, description)         
+                path, decoder, unit, description = item
+                # Register the D-Bus path with placeholder value and metadata (if available)
+                self._InverterService.add_path(path, None, writeable=False)
             
-                # Keep the unmapped set within max size
-                if len(self.unmapped_seen) > MAX_UNMAPPED_DGNS:
-                    removed = self.unmapped_seen.pop()
-                    logger.debug(f"[{self.frame_count:06}] [UNMAPPED SET] Removed DGN 0x{removed:05X} to cap size")
+        # Register /Mgmt/xantrex-can paths on both services                                         
+        self._InverterService.add_path('/FirmwareVersion',         FIRMWARE_VERSION,          writeable=False)
+        self._InverterService.add_path('/ProductId',               PRODUCT_ID,                writeable=False)
+        self._InverterService.add_path('/DeviceInstance',          DEVICE_INSTANCE,           writeable=False)
+        self._InverterService.add_path('/Connected',               1,                         writeable=False)
+        self._InverterService.add_path('/Status',                  'initializing',            writeable=False)
+        self._InverterService.add_path('/Error',                   0,                         writeable=False)
+        self._InverterService.add_path('/Mgmt/ProcessAlive',       1,                         writeable=False)
+        self._InverterService.add_path('/Mgmt/LastUpdate',         '',                        writeable=False)
+        self._InverterService.add_path('/Mgmt/ManufacturerCode',   119,                       writeable=False)
+        self._InverterService.add_path('/Mgmt/ProcessName',        'xantrex_nmea',            writeable=False)
+        self._InverterService.add_path('/Mgmt/ProcessVersion',     SCRIPT_VERSION,            writeable=False)
+        self._InverterService.add_path('/Mgmt/ProcessInstance',    0,                         writeable=False)
+        self._InverterService.add_path('/Mgmt/Connection',         f"CAN@{CAN_INTERFACE}",    writeable=False)                               
+        self._InverterService.add_path('/Mgmt/Type',               'inverter',                writeable=False)
+                                                                                                                 
+        self._InverterService.add_path('/CustomName',     PRODUCT_NAME,                       writeable=False)
+        # /ProductName is listed as a mandatory path for product services in the D-Bus API (along with /ProductId, /FirmwareVersion, /DeviceInstance, /Connected).
+        # This is what shows in the device list.
+        self._InverterService.add_path('/ProductName',    PRODUCT_NAME + ' (Inverter)',       writeable=False)
+                                                                                                                     
+        self._InverterService.add_path('/IsInverterCharger',         1,                       writeable=False)
+        self._InverterService.add_path('/Capabilities/HasAcPassthroughSupport', 1,            writeable=False)
+        
+        # Register additional derived D-Bus paths
+        # These are not mapped directly from PGNs but are calculated at runtime
+        # includes meta data units and description
+        self._InverterService.add_path('/Dc/Instance',              0,                         writeable = False)
+        self._InverterService.add_path('/Dc/0/Power',               0,                         writeable = False)
+
+        # /Mode can be changed by the GUI to affect inverter operation 
+        self._InverterService.add_path('/ModeIsAdjustable',          1,                        writeable=False)
+        self._InverterService.add_path('/Mode', MODE_ON,  onchangecallback = self.handle_mode_change,  writeable = True)  # default ON
+
+        self._InverterService['/Status'] = 'ok'
+        self._InverterService['/State'] = 0   # prime the state as off.  If the unit is not on it will be correct.  If is on, it will be quickly updated.
+
+        # get the system configured CAN ID for the interface we've sellected 
+        can_id_path = '/Settings/Vecan/' + CAN_INTERFACE + '/MainInterface/Nad' 
+        our_can_address = vedbus.VeDbusItemImport(self.system_bus, 'com.victronenergy.settings', can_id_path).get_value()
+        
+        # allocate our CAN channel and register the receive packet handler
+        self.nmea = NMEA2000(our_can_address)
+        self.nmea.register_rx_callback (self._handle_can_frame)
+                            
+        # add all our desired PGNs to the filter
+        for pgn, PGN_items in self.INVERTER_RX_PGN_MAP.items():
+            self.nmea.add_can_filter (pgn)
+        
+        logger.info("Service initialization complete")
+
+    # This method gets called when the /Mode dbus variable is changed by the
+    # GUI.  We use it to change the mode that the inverter/charger is working
+    # in.
+    def handle_mode_change (self, path, requested_mode):
+        if (requested_mode == MODE_OFF): 
+            self.nmea.send_nmea_message ("CONTROL_CHARGER", 0)
+            self.nmea.send_nmea_message ("CONTROL_INVERTER", 0)
+        elif (requested_mode == MODE_INVERTER): 
+            self.nmea.send_nmea_message ("CONTROL_CHARGER", 0)
+            self.nmea.send_nmea_message ("CONTROL_INVERTER", 1)
+        elif (requested_mode == MODE_CHARGER): 
+            self.nmea.send_nmea_message ("CONTROL_CHARGER", 1)
+            self.nmea.send_nmea_message ("CONTROL_INVERTER", 0)
+        elif (requested_mode == MODE_ON):                   
+            self.nmea.send_nmea_message ("CONTROL_CHARGER", 1)
+            self.nmea.send_nmea_message ("CONTROL_INVERTER", 1)
+
+        self._InverterService[path] = requested_mode
+        return True                       
+    
+                                                  
+    # Handle NMEA PGN 126983 Alarm packet
+    # The NMEA alert acknowledgment package is identical to the originating
+    # alert packet minus some flag bytes.  So we just copy the alert packet and
+    # then append a command code.
+    # The Xantrex, goes from alert state to silenced, then to acknowledged.  As
+    # soon as an alarm comes fro the Xantrex, we silence and then acknowledge
+    # it.
+    # This is independent of the Cerbo GUI screen.  When the alert first comes
+    # from the Xantrex, we return a 1 which get pushed to the GUI /Alarm/...
+    # dbus entry.  The GUI does its own silencing which doesn't get pushed to
+    # us.
+    def alarm(self, data: bytes) -> int:
+        # NMEA Alarm State values
+        ALARM_STATE_NORMAL      = 1
+        ALARM_STATE_ACTIVE      = 2
+        ALARM_STATE_SILENCED    = 3
+        ALARM_STATE_ACKED       = 4
+        ALARM_STATE_WAIT_ACK    = 5
+
+        # NMEA Alarm acknowledge values
+        ALARM_ACK_ACKNOWLEDGE   = 0
+        ALARM_ACK_SILENCE       = 1
+
+        # NMEA Alarm Alert PGN 126983 useful indexes
+        ALARM_IDX_ID            = 3
+        ALARM_IDX_FLAGS         = 16            # flags that are removed in acknowledgement response
+        ALARM_IDX_STATE         = 27
+ 
+        alarm_state = data[ALARM_IDX_STATE]
+        # parse the response packet from the incoming alert packet - This is
+        # defined by NMEA PGN 126983 and PGN 126984
+        alarm_response_pkt = data[:ALARM_IDX_FLAGS] + data[ALARM_IDX_FLAGS + 1: -3]
+        raise_gui_alarm = 0                     # this gets sent to the GUI
+
+        print (f"{alarm_state=}")
+        if alarm_state == ALARM_STATE_ACTIVE:
+            self.nmea.send_nmea_message ("ACK_ALARM", alarm_response_pkt, ALARM_ACK_SILENCE)
+            raise_gui_alarm = 1                 
+        elif alarm_state == ALARM_STATE_SILENCED:
+            self.nmea.send_nmea_message ("ACK_ALARM", alarm_response_pkt, ALARM_ACK_ACKNOWLEDGE)
+        elif alarm_state == ALARM_STATE_WAIT_ACK:
+            self.nmea.send_nmea_message ("ACK_ALARM", alarm_response_pkt, ALARM_ACK_ACKNOWLEDGE)
+            # we return the GUI alarm back to zero to allow for the next
+            # occurance to register
+            raise_gui_alarm = 0
+        
+        return raise_gui_alarm
+    
+    # This method only exist because we don't know what the NMEA codes are for
+    # some Xantrex faults.  They are documented in the NMEA spec - shich I
+    # don't have.  When I ask Xantrex Tech Support, they say check the spec -
+    # helpful?!?
+    # Anyways, this logs a warning with hopfully enough info to let us
+    # determine what kind a Alert it is.  Once we know it, we can come back and
+    # update the code.... eventually removing this method entirely.
+    def unknown_alarm (self, data: bytes) -> int:
+        alarm_id = data[3]                                      
+
+        if alarm_id not in self.unknown_alarm_logged:
+            self.unknown_alarm_logged.append (alarm_id)
+            
+            battery_current = self._InverterService['/Dc/0/Current']
+            ac_current_out  = self._InverterService['/Ac/Out/L1/I'] 
+            ac_volts_out    = self._InverterService['/Ac/Out/L1/V'] 
+            ac_volts_in     = self._InverterService['/Ac/In/L1/V'] 
+
+            logger.warning (f"Unknown Alarm ID ({alarm_id}): {battery_current=}A, {ac_volts_in=}V, {ac_volts_out=}V, {ac_current_out=}A") 
+
+        # always return 0 because we don't want to tell the GUI stuff we don't know
+        return 0
+        
+    # Calculate power values from voltage and current paths
+    def update_derived_values(self):
+        
+        # Triggered whenever we receive a PGN listed in DERIVED_DGNS.
+        # • Recomputes V×I power for individual measurement points
+        # • Sums AC totals (input / output) and mirrors them to aliases
+        # compute and publish P = V × I for inverter service
+        def compute_power(dst_path: str, v_path: str, c_path: str) -> None:
+            try:                              
+                # Fetch the source D-Bus items
+                v_item = self._InverterService[v_path]
+                c_item = self._InverterService[c_path]
                 
-            return True  
-            
-        name_hint           = self._dgn_name_hints[dgn]
-        services_touched    = set()
-
-        # --- Decode all D-Bus values associated with this DGN and push to D-Bus  ---
-        # item = (path, decoder, unit, description, dbus_paths, service)
-        for item in dgn_items:
-            try:
-                # Check for unexpected tuple lengths before unpacking
-                if len(item) != 6:
-                    raise ValueError(f"[{self.frame_count:06}] [DGN ERROR] Unexpected tuple size for {item}")
+                # Skip if missing/placeholder ([], None). Zeros are OK.
+                if (v_item is None or c_item is None):
+                    return
                     
-                path, decoder, unit, description, dbus_paths, service = item
+                # Calculate and publish power
+                p = round(v_item * c_item, 1)
+                self._InverterService[dst_path] = p
 
-                # Safely decode data using the provided decoder function.
-                # If decoding fails, log the error and increment error counter.
+                logger.info(f"[{self.frame_count:06}] [DERIVED - COMPUTE POWER]  {dst_path}={p:.1f} W (V={v_item} V × I={c_item} A)")
+        
+            except Exception as e:
+                logger.exception(f"[{self.frame_count:06}] [DERIVED FAIL]  {dst_path}={p:.1f} W (V={v_item} V × I={c_item} A)")
+
+        # Individual power paths (DC)
+        compute_power('/Dc/0/Power',   '/Dc/0/Voltage',    '/Dc/0/Current')
+                                                
+        
+    # Process a single incoming CAN frame, decode its NMEA data, and update D-Bus paths.
+    def _handle_can_frame(self, pgn, src, len, data):
+        skipped_none = 0
+        processed    = 0
+        errors       = 0
+                    
+        self.frame_count += 1       
+        self.isthereaframe = 1                  # indicate that there is CAN acitivity
+        
+        # Look up this PGN in our pre-built map.
+        PGN_dict = self.INVERTER_RX_PGN_MAP.get(pgn) 
+
+        # if this is a multiple CAN packet frame, then it needs to be assembled
+        if PGN_dict['Fast_Packet']:
+            self.frame_available, data = self.nmea.AssembleFastPacket(data)
+        else:
+            self.frame_available = True  # it's a single packet
+                                                     
+        # --- Decode all D-Bus values associated with this PGN and push to D-Bus  ---
+        # item = (path, decoder, unit, description)
+        if self.frame_available:
+            PGN_items = PGN_dict['SPNs'] 
+            for item in PGN_items:
                 try:
-                    value = decoder(data)
+                    # unpack our decoder item
+                    path, decoder, unit, description = item
+         
                     
-                except Exception as e:
-                    self.error_count += 1
-                    errors           += 1 
-                    logger.error(f"[{self.frame_count:06}] [DECODE ERROR] {path}: {e} | decoder={getattr(decoder, '__name__', repr(decoder))} | data={data.hex(' ').upper()}")
-                    continue
-                    
-                # If decoding failed (returned None), skip this path
-                if value is None:
-                    skipped_none += 1    
-                    continue
+                    # Safely decode data using the provided decoder function.
+                    # If decoding fails, log the error and increment error counter.
+                    try:
+                        value = decoder(data)
 
-                # The DGN is known, but the specific path might not exist on this *service* 
-                # Instead of raising KeyError (which would drop *all* remaining signals in the same frame) we log a warning and move on so the
-                # other signals can still be processed.
-                if path not in dbus_paths:
-                    logger.error(f"[{self.frame_count:06}] [MISSING PATH][{service.descriptor}] DGN=0x{dgn:05X} | path={path} | data={data.hex().upper()}")
-                    continue
-                    
-                # special odd handling, I have not come up with a cleaner way to deal with.  
-                
-                #if inverter reports Inverting but current is 0, force Standby ---
-                if dgn == 0x1FFD4 and service is self._InverterService and path == '/State':
+                    except Exception as e:
+                        self.error_count += 1
+                        errors           += 1 
+                        logger.error(f"[{self.frame_count:06}] [DECODE ERROR] {path}: {e} | decoder={getattr(decoder, '__name__', repr(decoder))} | data={data.hex(' ').upper()}")
+                        continue
+
+                    # If decoding failed (returned None), skip this path
+                    if value is None:
+                        skipped_none += 1    
+                        continue
+
+                    # special odd handling, I have not come up with a cleaner way to deal with.  
+                    # if inverter reports Inverting but current is 0, force Standby ---
                     # Venus OS enum: 9 = Inverting, 1 = Standby
-                    if int(value) == 9:
+                    if path == '/State' and int(value) == 9:
                         # Prefer the explicit L1 voltage; fall back to the aggregate if needed
-                        i_out = (self._InverterService['/Ac/Out/L1/I'] or self._InverterService['/Ac/Out/I'] or 0)
-                        logger.debug(f"[{self.frame_count:06}] [Inverter State OVERRIDE] Inverting→Standby; Incoming RV-C State={value} | Current out={i_out} A | Data={data.hex(' ').upper()}")
-
+                        i_out = (self._InverterService['/Ac/Out/L1/I'] or 0)
                         # Treat no current as Standby.
                         if i_out == 0:   
-                            value = 1  # Standby
-                             
-                   
-                try:
-                    service[path] = value       # → pushes to D-Bus
-                        
-                    # DGN is known and matched; value was decoded and now SENT                        
-                    logger.info(f"[{self.frame_count:06}] [SENT][{service.descriptor}] DGN=0x{dgn:05X} | path={path} | value={value} {unit} | desc=\"{description}\" | raw={data.hex(' ').upper()}")
-                        
-                    #if dgn in (0x1FFCB, 0x1FFDD, 0x1FFD6, 0x1FFD7, 0x1FFDC):
-                    #    logger.info(f"[GUIDMODS DISPLAY] DGN=0x{dgn:05X} | path={path} | value={value} {unit} | desc=\"{description}\"")
+                            value = 1  # Standby    
+                            logger.info(f"[{self.frame_count:06}] [Inverter State OVERRIDE] Inverting→Standby; Incoming RV-C State={value} | Current out={i_out} A | Data={data.hex(' ').upper()}")
+                                   
+                    try:
+                        self._InverterService[path] = value       # → pushes to D-Bus
+                        processed += 1
 
-                    processed += 1
-                    services_touched.add(service)
+                        # PGN is known and matched; value was decoded and now SENT                        
+                        logger.info(f"[{self.frame_count:06}] [SENT][{self._InverterService.descriptor}] PGN=0x{pgn:05X} | path={path} | value={value} {unit} | desc=\"{description}\" | raw={data.hex(' ').upper()}")
+
+
+                    except Exception as send_error:
+                        logger.error(f"[{self.frame_count:06}] [DBUS SEND ERROR][{self._InverterService.descriptor}] PGN=0x{pgn:05X} | path={path} | value={value} {unit} | desc=\"{description}\" | raw={data.hex(' ').upper()} | {send_error}")
+                        continue
                         
-                except Exception as send_error:
-                    logger.error(f"[{self.frame_count:06}] [DBUS SEND ERROR][{service.descriptor}] DGN=0x{dgn:05X} | path={path} | value={value} {unit} | desc=\"{description}\" | raw={data.hex(' ').upper()} | {send_error}")
-                    continue
-                        
+                except Exception as e:
+                    self.error_count += 1
+                    logger.error( f"[{self.frame_count:06}] [DECODE ERROR 2] {path}: {e} | {self.format_can_frame(pgn, data)}" )
 
-            except Exception as e:
-                self.error_count += 1
-                if self.debug:
-                    logger.error( f"[{self.frame_count:06}] [DECODE ERROR 2] {path}: {e} | {self.format_can_frame(dgn, can_dlc, data)}" )
+            timestamp = time.time()  
+            self._InverterService['/Mgmt/LastUpdate'] = timestamp
+            logger.info(f"[{self.frame_count:06}] [FRAME SUMMARY][{self._InverterService.descriptor.upper()}] [PGN 0x{pgn:05X}] → {processed} sent, {skipped_none} null values, {errors=}")
 
-        timestamp = time.time()  
-        for svc in services_touched:
-            svc['/Mgmt/LastUpdate']        = timestamp
-            logger.info(f"[{self.frame_count:06}] [FRAME SUMMARY][{svc.descriptor.upper()}] [DGN 0x{dgn:05X}] → {processed} sent, {unchanged} unchanged, {skipped_none} null values, {errors} errors")
- 
-        # After decoding known paths, calculate and send derived values
-        if dgn in DERIVED_DGNS:
-            # cache frame context for logging
-            self.last_dgn   = pgn 
-            self.last_src   = src
-            self.last_canid = can_id
-
+            # After decoding known paths, calculate and send derived values
             self.update_derived_values()  
-
-        return True
-
+        return True     
 
     def start_heartbeat(self, interval=5):   # set the default to 5 s if not passed
-        def sync_mode_from_status(self):
-            inverter_service = self._InverterService
-            MODE_ON, MODE_OFF = 3, 4
-            
-            try:
-                raw_status  = inverter_service['/Status']   # int when on; None when not on
-                is_off      = (raw_status is None) or (raw_status == 0)
-                target_mode = MODE_OFF if is_off else MODE_ON
-                
-                if inverter_service['/Mode'] != target_mode:
-                    inverter_service['/Mode'] = target_mode
-                return True
-                
-            except Exception as error:
-                try:
-                    if inverter_service['/Mode'] != MODE_OFF:
-                        inverter_service['/Mode'] = MODE_OFF
-                except Exception:
-                    pass
-                    logger.warning("[SET MODE ERROR] sync_mode_from_status: forcing Off (%s)", error)
-                    
-                return False
- 
-        def set_state(self):
+        def _set_state(self):
             def check_path(value, default=0):
                 return default if value is None else value
 
             inverter_service = self._InverterService
-            charger_service  = self._ChargerService
-
 
             if self.isthereaframe == 1:   # so we have a frame, which means the unit is on.
                 self.isthereaframe = 0   #  reset the flag
 
-                grid_current    = check_path( inverter_service['/Ac/Grid/L1/I'] )
+                grid_current    = check_path( inverter_service['/Ac/In/L1/I'] )
                 battery_current = check_path( inverter_service['/Dc/0/Current'] )
                 ac_current_out  = check_path( inverter_service['/Ac/Out/L1/I'] )    # assume this is set only when inverting
                 ac_volts_out    = check_path( inverter_service['/Ac/Out/L1/V'] )    # the volts can be out, but no current drawing 
-                ac_volts_in     = check_path( charger_service['/Ac/In/L1/V'] )
-                #passthrough_is  = check_path( charger_service['/Ac/PassThrough/Active'] )  #  not sure about this.  could be chicken or the egg  assuming the frames do not set this.
 
                 logger.debug(
                     f"[{self.frame_count:06}] [SET STATE] "
                     f"grid_I={grid_current:.2f}A, batt_I={battery_current:.2f}A, "
                     f"ac_out_I={ac_current_out:.2f}A, ac_out_V={ac_volts_out:.1f}V, "
-                    f"ac_in_V={ac_volts_in:.1f}V, "
                     f"inv_state={int(check_path(inverter_service['/State']))}, "
-                    f"chg_state={int(check_path(charger_service['/State']))}"
                 )
-
-                # comment out to try the DGN decoder changes
-                
-                        # ---------------- CHARGER /State ----------------
-                # Leave non-zero state alone; only set when currently Off (0) assuming it will be set by a frame
-                #if check_path( charger_service['/State']) == 0:   # off  Do not trust it when not set, but if it is, leave it be assuming it came from a good frame.                
-                #    if ac_volts_in  > 0:  # incoming volts
-                #        charger_service['/State']  = 3   # float just a default  probably not correct, need more data???  
-                #    else:
-                #        charger_service['/State'] = 0
-                
-                # ---------------- INVERTER /State ----------------                
-                # check the inverter paths to set it's /State
-                #if check_path( inverter_service['/State']) == 0:   # off  Do not trust it when not set, but if it is, leave it be assuming it came from a good frame.
-
-                # Assist (10): shore present AND battery is discharging
-                #if grid_current and battery_current is not None and  battery_current < 0:
-                #    inverter_service['/State'] = 10   # venus os assisting value
-
-                #elif ac_volts_in == 0 and ac_current_out > 0:
-                #    inverter_service['/State'] = 9  # Inverting
-                    
-                #elif ac_volts_out > 0:   # no current but voltage    
-                #    inverter_service['/State'] = 1   # standby
-                       
-                #elif ac_volts_in > 0:   
-                #    inverter_service['/State'] = 8   # pass-through
-    
 
             else:   # the unit is off
                 inverter_service['/State'] = 0   # No frame, so show off.
-                charger_service['/State']  = 0                
   
             return True    
         
@@ -1621,20 +1028,12 @@ class XantrexService:
                 self._InverterService['/Mgmt/ProcessAlive']      = self.heartbeat_counter
                 self._InverterService['/Mgmt/LastUpdate']        = self.last_heartbeat
 
-                # Charger heartbeat updates
-                self._ChargerService['/Mgmt/ProcessAlive']       = self.heartbeat_counter
-                self._ChargerService['/Mgmt/LastUpdate']         = self.last_heartbeat
-                
-
-
-                # Optionally log the heartbeat timestamp if verbose/debug is enabled
+                # Optionally log the heartbeat timestamp
                 logger.info(f"[HEARTBEAT] {self.last_heartbeat}")
                 
-                # check /Status to set  /mode  rv-c from xantrex does not send it.
-                set_state(self)
-                sync_mode_from_status(self)
-
-
+                # update /Status based on CAN activity
+                _set_state(self)
+        
             except Exception as e:
                 logger.error(f"[HEARTBEAT ERROR] {e}")                    
             return True
@@ -1646,25 +1045,17 @@ class XantrexService:
 
     # Cleanup CAN socket
     def cleanup(self):
-        if self.verbose:
-            if self.unmapped_counts:
-                logger.info("[UNMAPPED SUMMARY] DGNs seen but not mapped:")
-                for dgn, count in sorted(self.unmapped_counts.items()):
-                    logger.info(f"  - DGN 0x{dgn:05X}: {count} time(s)")
-
         # === Summary Block ===
-        unmapped_total = sum(self.unmapped_counts.values())
-        successful_decodes = self.frame_count - unmapped_total - self.error_count
+        successful_decodes = self.frame_count - self.error_count
 
         try:
-            assert (unmapped_total + self.error_count + successful_decodes) == self.frame_count
+            assert (self.error_count + successful_decodes) == self.frame_count
         except AssertionError:
             logger.warning("⚠️ Frame count mismatch in summary!")
 
         logger.info("=== Shutdown Summary ===")
         logger.info(f"  Total frames received      : {self.frame_count}")
         logger.info(f"  Decoded successfully       : {successful_decodes}")
-        logger.info(f"  Unmapped DGNs              : {unmapped_total}")
         logger.info(f"  Decode errors              : {self.error_count}")
         logger.info("==========================")
 
@@ -1674,9 +1065,9 @@ class XantrexService:
             ("remove watch_id",              lambda: ((GLib.source_remove(self.watch_id), setattr(self, 'watch_id', None))[1] if getattr(self, 'watch_id', None) else None)),
             ("quit main loop",               lambda: self.loop.quit() if getattr(self, 'loop', None) else None),
             ("close CAN socket",             lambda: self.socket.close() if getattr(self, 'socket', None) else None),
-            ("close inverter bus",           lambda: getattr(self, 'inverter_bus', None) and self.inverter_bus.close()),
-            ("close charger  bus",           lambda: getattr(self, 'charger_bus',  None) and self.charger_bus.close()),
+            ("close inverter bus",           lambda: getattr(self, 'system_bus', None) and self.system_bus.close()),
             ("remove timeout_heartbeat",     lambda: GLib.source_remove(self.timeout_heartbeat) if getattr(self, 'timeout_heartbeat', None) else None),
+            ("remove transmit task",         lambda: GLib.source_remove(self.transmit_task) if getattr(self, 'transmit_task', None) else None),
         ]
 
         # Run each step and catch its errors individually
@@ -1703,17 +1094,15 @@ def main():
     try:
       
         # Initialize the service with flags from CLI arguments
-        service = XantrexService(debug = args.debug, verbose = args.verbose)
+        service = XantrexService()
 
         # Set up the main GLib event loop for D-Bus
         service.loop = GLib.MainLoop()
-
-        # startup log message if verbose is enabled
         logger.info("Starting main loop...")
 
         # Start the background thread that periodically updates ProcessAlive
         #service.start_heartbeat_thread()
-        service.start_heartbeat(1)
+        service.start_heartbeat(2)
 
 
         # Enter the main loop (non-blocking events will be handled here)
@@ -1725,7 +1114,6 @@ def main():
     finally:
         if service:
             service._InverterService['/Status'] = 'offline'
-            service._ChargerService['/Status']  = 'offline'
             service.cleanup()
 
         logger.info("Service stopped")

@@ -1,0 +1,151 @@
+0x1FF54: PGN (130900)  Xantrex Proprietary    
+     6)       987.0  Rx     1DFF5400  8  E0 14 A8 98 01 01 88 86 
+     7)      1006.9  Rx     1DFF5400  8  E1 2E 09 00 66 17 FF FF 
+     8)      1026.9  Rx     1DFF5400  8  E2 FF FF FF FF FF FF 7F 
+
+14 A8 98 01 01 88 86 2E 09 00 66 17 FF FF FF FF FF FF FF FF 7F
+__
+Packet length = 20 bytes
+   _____
+   Manf Codes etc  XANTREX = 168 (0xA8)
+         __
+         Instance (input AC line) = 01
+            __
+            Line Total
+               __
+               Flags
+                  -----
+                  Volts (0.01V) 0x2e86 = 11910
+                        -----
+                        Current (A) 0x0009 = 9
+                              -----
+                              Frequency (0.01 Hz)  (0x1766 = 5990)
+
+    
+0x1FF54: PGN (130900)  Xantrex Proprietary    
+    52)      2355.1  Rx     1DFF5400  8  C0 14 A8 98 02 01 88 E0 
+    53)      2375.2  Rx     1DFF5400  8  C1 2E 04 00 70 17 2F 00 
+    54)      2395.2  Rx     1DFF5400  8  C2 00 00 11 00 00 00 7F 
+
+Assemble into one packet (first byte is a sequence number)
+
+14 A8 98 02 01 88 E0 2E 04 00 70 17 2F 00 00 00 11 00 00 00 7F
+__
+Packet length = 20 bytes
+   _____
+   Manf Codes etc  XANTREX = 168 (0xA8)
+         __
+         Instance (output AC line) = 02
+            __
+            Line Total
+               __
+               Flags
+                  -----
+                  Volts (0.01V) 0x2ee0 = 12000
+                        -----
+                        Current (0.1A) 0x0004 = 0.4
+                              -----
+                              Frequency (0.01 Hz)  (0x1770 = 6000)
+                                    -----------
+                                    Power in W   (0x0000002f = 47)
+                                                -----------
+                                                Reactive Pwr W  (0x000000011 = 17)
+                                                            __
+                                                            Power Factor (0x7f = -1)
+                                                            
+
+0x1F214: PGN 127508 - Battery Status        
+                                    
+   114)      5996.5  Rx     19F21400  8  01 16 05 00 00 44 7A 01 
+    18)      1226.9  Rx     19F21400  8  01 17 05 00 00 44 7A 01 
+                                            ____
+                                            Battery Volts (0.01)
+                                                 _____
+                                                 Battery current (0.1)
+                                                       _____
+                                                       Temperature  0.01K
+
+0x1F307: PGN 127751 - DC Voltage/Current
+    61)      2535.2  Rx     19F30700  8  01 01 82 00 70 FE FF FF 
+    23)      1327.0  Rx     19F30700  8  01 01 82 00 00 00 00 FF 
+                                            __
+                                            Connection (01 = input, 02 = output)
+                                               _____
+                                               Battery Volts (0.1V)
+                                                     ________
+                                                    Battery Amps (0.01A) (signed 24 bits)
+                                                              __
+                                                              Unused
+
+0x1F300: PGN 127744 - AC Power / Current - Phase A
+    19)      1247.0  Rx     19F30000  8  01 01 09 00 FF FF FF 7F 
+    58)      2475.2  Rx     19F30000  8  01 02 04 00 2F 00 00 00 
+                                            __
+                                            Connection (01 = input, 02 = output)
+                                               ____
+                                               Amps (0.1A)
+                                                     __________
+                                                     Power (W) u32 - Watts - This never works for input power
+
+0x1F303: PGN 127747 - AC Voltage / Frequency - Phase A
+
+    21)      1286.9  Rx     19F30300  8  01 01 A7 04 FF FF 57 02 
+    60)      2515.2  Rx     19F30300  8  01 02 B0 04 FF FF 58 02 
+                                            __
+                                            Connection (01 = input, 02 = output)
+                                               _____
+                                               Volts (0.1V) Line to neutral
+                                                     _____
+                                                     Volts (0.1V) Line to Line
+                                                           ____
+                                                           Frequency (0.1Hz)
+
+0x1F306: PGN 127750 - Converter Status
+   113)      5976.6  Rx     19F30600  8  01 01 09 C0 FF FF FF FF 
+    17)      1206.9  Rx     19F30600  8  01 01 03 C0 FF FF FF FF
+                                               __
+                                               Converter state
+        CONVERTER_STATE (0 - 255)
+        Value	Description
+        0	Off
+        1	Low Power Mode
+        2	Fault
+        3	Bulk
+        4	Absorption
+        5	Float
+        6	Storage
+        7	Equalize
+        8	Pass thru
+        9	Inverting
+        10	Assisting                                                 
+
+                                                           
+
+
+                                                              
+0x1F007: PGN 126983 - Alert
+    44)      2195.1  Rx     09F00700  8  20 1C 15 02 04 07 00 73 
+    45)      2215.2  Rx     09F00700  8  21 8E 16 15 01 A1 46 C1 
+    46)      2235.2  Rx     09F00700  8  22 01 01 FF D8 FF FF FF 
+    47)      2255.2  Rx     09F00700  8  23 FF FF FF FF FF 11 00 
+    48)      2275.2  Rx     09F00700  8  24 02 FF FF FF FF FF FF 
+
+
+
+0x1F009: PGN 126985 - Alert Text
+    38)      2075.2  Rx     09F00900  8  91 00 00 00 00 00 00 00 
+    39)      2095.2  Rx     09F00900  8  92 00 00 00 00 00 00 00 
+    40)      2115.2  Rx     09F00900  8  93 00 00 00 00 00 00 00 
+    41)      2135.2  Rx     09F00900  8  94 00 00 00 00 00 00 00 
+    42)      2155.2  Rx     09F00900  8  95 00 00 00 00 00 00 00 
+    43)      2175.2  Rx     09F00900  8  96 00 00 00 00 FF FF FF 
+
+ 
+
+
+
+
+
+
+
+                                                           

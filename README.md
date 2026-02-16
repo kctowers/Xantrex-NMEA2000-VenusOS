@@ -1,51 +1,31 @@
-# Xantrex RV-C → Venus OS D-Bus Driver (Cerbo or Pi)
+# Xantrex XC Pro Marine Inverter/Charger
+## Venus OS D-Bus Driver (Cerbo) NMEA 2000
 
 
-### 🙏 Acknowledgements - Nov, 20 2025
-Big thank-you to **Stephen Tenburg**!  
-My focus was mostly the inverter side.  I had the charger side, roughly working, but not finished.  He greatly helped me finish the charger support, which is now solid and well-tested.
+**Date Updated:** Feb 20, 2025  
+**Kevin Towers**
 
-Stephen wrote an **in-depth, step-by-step guide** for using this driver with a **VE Cerbo GX**:  
-[Connecting a Victron Cerbo to a Xantrex XC-Pro](https://www.avoidpitfalls.com/connecting-a-victron-cerbo-or-venus-to-a-xantrex-xc-pro/)
+It is a Python service that reads Xantrex Freedom Pro Marine (NMEA 2000) (CAN) frames and publishes decoded values to Victron Venus OS D-Bus, running on a PI or Cerbo, as inverter service.
 
-
-**Date Updated:** Sep 14, 2025  
-**Scott Sheen**
-
-This is my first python project.  I created it so I could have my Xantrex inverter/charger talk to my Pi running venus os.
-
-It is a Python service that reads Xantrex Freedom Pro RV-C (CAN) frames and publishes decoded values to Victron Venus OS D-Bus, running on a PI or Cerbo, as inverter and charger services.
-
-As of September 14, 2025, this is still under development with issues on the charger side.  The State for the inverter has an issue.
-
-**NOTE:** Hardware support is required.   For the raspberry Pi (and Cerbex I am sure) you needed a *USB to CAN Bus Converter Base Open-Source Hardware CANable*, which can be found on Amazon.  This will connect to the Xantrex.  I will put up pictures to help.
-
-**NOTE:** Other inverter/charger devices that support RV-C may also work.  I see no reason why they wouldn't as long as they support the RV-C standard.  Would just need to tweak the product name, and the source.
-
-- Inverter service: com.victronenergy.inverter.can_xantrex
-- Charger service:  com.victronenergy.charger.can_xantrex
-
-**Target:** Venus OS - I have tested with v3.15+ (Python 3.8 on Raspberry Pi). 
+**Target:** Venus OS - I have tested with v3.67 (Python 3.12 on Cerbo GX). 
 
 -------------------------------------------------------------------------------
 
 ## FEATURES
 
-- Decodes key RV-C DGNs and maps them to Venus D-Bus paths (AC-in/out, DC bus, states, temperatures, flags).
-- Creates two services (inverter + charger) for a single physical unit with shared identity/management.
+- Decodes propietary Xantrex PGNs and maps them to Venus D-Bus paths which integrate with the Cerbo GUI.
+- Posts notications to GUI when Xantrex alarms on over/under range values
 - Heartbeat updates, /State path, and derived power calculations (e.g., P = V × I).
-- Structured frame logging with --debug / --verbose (logs under /data/xantrex-monitor/logs/).
-- Sends PGN requests on startup (Address Claimed, Product ID, Model Info, AC metrics, state, etc.).
-- Default Can is Can10
+- CAN frames are filtered in hardware
+- Written in Python
 
 -------------------------------------------------------------------------------
 
 ## REQUIREMENTS
 
-- Venus OS device with Python 3.8 and D-Bus/GLib available.
-- SocketCAN interface configured (default: can10, 250 kbps).
+- Venus OS device with Python 3.12 and D-Bus/GLib available.
+- SocketCAN interface configured (default: vecan0, 250 kbps).
 - Permission to access CAN sockets (root or appropriate capabilities).
-- RV-C wiring to the Xantrex Freedom Pro.
 
 -------------------------------------------------------------------------------
 
@@ -57,35 +37,47 @@ As of September 14, 2025, this is still under development with issues on the cha
 ├─ xantrex_service.py    # this script
 └─ velib_python/         # optional vendored copy; I still have to confirm this.  Do not recall at the moment
 ```
+Note, you will have to download the velib_python from Github at: https://github.com/victronenergy/velib_python
 
-**2) Create logs directory**
+**2) Run the service**
 ```bash
-mkdir -p /data/xantrex-monitor/logs
+# Use this command line if you want to test any changes you made.  Ctrl-C will exit the script and allow you to
+# make further changes
+cd /data/xantrex-monitor
+python3 xantrex_service.py
+
+When you're ready for prime time, execute this:
+./start.sh
 ```
 
-**3) Bring up the CAN interface (example; adapt to your setup)**
-```bash
-ip link set can10 up type can bitrate 250000
+**3) Setup for automatic run at boot time**  
+Modify the file _/data/rc.local_ to add this line:
 ```
-
-**4) Run the service**
-```bash
-python3 /data/xantrex-monitor/xantrex_service.py
+/data/xantrex-monitor/start.sh
+```
+This will automatically run the _start.sh_ script on reboot.  
+Note: A new Cerbo may not have a _/data/rc.local_ file.  You will have to create it with these commands:
+```
+nano /data/rc.local
+   #!/bin/bash
+   /data/xantrex-monitor/start.sh
+chmod +x /data/rc.local
 ```
 
 **Optional Program parameters**
 ```text
---can IFACE    SocketCAN interface (default: can10)
---debug        Enable debug logging
---verbose      Very verbose logging
+--can IFACE    SocketCAN interface (default: vecan0)
+--log LEVEL    Enable logging (DEBUG, INFO, WARNING, ERROR, default: WARNING)
+--verbose      Dump all logs to the terminal as well as log files
 ```
 
 **Examples**
 ```bash
-# Use any combination of flags. During initial testing, enable --debug (and optionally --verbose).
-python3 /data/xantrex-monitor/xantrex_service.py --can can1
-python3 /data/xantrex-monitor/xantrex_service.py --debug
-python3 /data/xantrex-monitor/xantrex_service.py --debug --verbose
+# Use any combination of flags. During initial testing, enable --log (and optionally --verbose).
+python3 /data/xantrex-monitor/xantrex_service.py --can vecan1
+python3 /data/xantrex-monitor/xantrex_service.py --log INFO
+python3 /data/xantrex-monitor/xantrex_service.py --log INFO --verbose
+python3 /data/xantrex-monitor/xantrex_service.py --v
 ```
 
 -------------------------------------------------------------------------------
@@ -95,20 +87,14 @@ python3 /data/xantrex-monitor/xantrex_service.py --debug --verbose
 **Main loop:**
 - GLib main loop drives CAN receive and D-Bus exports.
 
-**D-Bus services:**
-- Two services are registered—inverter and charger—exported via private SystemBus connections to avoid conflicts when multiple root objects are present.
-
 **Source selection:**
-- Xantrex default source is 0x42 (inverter/charger) and and though I did not see documentation it also seems use 0xD0 (inverter). Filtering ensures the correct DGN values update the intended service.
-
-**Startup handshake:**
-- On start, sends a burst of PGN requests to solicit identity and status.  For me it does not seem to respond to most.  (e.g., Address Claimed EE00, Product Identification FEEB, Model Info FFDE, AC metrics FFD7, state FFD4/FFD5, Software ID FEEF, segmented info 0EBFF). Responses populate /Info/*, /Firmware/*, /Mgmt/*, /State, and AC/DC paths.
+- The service retrieves the CAN device ID from the Cerbo CAN NMEA driver.  This is used for all transmissions.
 
 **Mapping/decoding:**
-- DGNs are decoded from frame payloads and mapped to canonical Venus paths. Derived values are computed where useful (e.g., power).
+- PGNs are decoded from frame payloads and mapped to canonical Venus paths. Derived values are computed where useful (e.g., power).
 
 **Logging:**
-- Structured logging supports --debug and --verbose. Frame counts and source IDs aid traceability. Logs default to /data/xantrex-monitor/logs/xantrex.log.
+- Structured logging supports --log and --verbose. Frame counts and source IDs aid traceability. Logs default to /data/xantrex-monitor/logs/xantrex.log.
 
 **Clean shutdown:**
 - Signal handling exits the main loop, unregisters D-Bus objects, and closes CAN sockets to avoid stale bus names on restart.
