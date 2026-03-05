@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-# Version: 1.0.0.2026.02.16
-# Date: 2026-02-16
 
-# Xantrex Freedom Pro NMEA 2000 D-Bus Driver
+# Xantrex Freedom Pro NMEA-2000 D-Bus Driver
 #
 
 # This script reads raw NMEA-2000 (CAN) data from a Xantrex Freedom Pro Marine inverter/charger
@@ -77,11 +75,10 @@ import vedbus
 # --- Constants defining service identity and CAN parameters ---
 DEVICE_INSTANCE        = 0                      # This driver only supports a single instance, so hardcoded here
 PRODUCT_ID             = 1234
-FIRMWARE_VERSION       = '2.14'    # hard coded, matches mine.
+FIRMWARE_VERSION       = '2.14'                 # hard coded, matches mine.
 XANTREX_INVERTER_MODEL = 2000                   # 2000 or 3000 Watt inverter
 PRODUCT_NAME           = 'Freedom XC Pro ' + str(XANTREX_INVERTER_MODEL) + ' Marine'
-SCRIPT_VERSION         = '1.0.0.2026.01.25'
-MAX_UNMAPPED_PGNS      = 100
+SCRIPT_VERSION         = '1.0.1.2026.03.05'
 
 # ManufacturerCode = 119
 
@@ -439,7 +436,11 @@ class NMEA2000:
             sa      = (self._our_address & 0xFF)                # Source Address (SA) 
             can_id  = (pri << 26) | (pgn << 8) | sa             # 29-bit CAN ID: Priority + PGN + source address
             can_id |= self.CAN_EFF_FLAG                         # mark this as a extended frame ID 
-            
+     
+            padding_needed = 8 - len(data)      # pad all packets to 8 bytes
+            padding = bytearray(b'\xff' * padding_needed)    # pad with 0xFF
+            data += padding
+
             # We need to format a C structure for the call to socket.send().  The structure has the format:
             # struct can_frame {
             #     canid_t can_id;  /* 32 bit CAN_ID + EFF/RTR/ERR flags */
@@ -450,9 +451,9 @@ class NMEA2000:
             #     __u8    data[8] __attribute__((aligned(8)));
             # };
             frame      = struct.pack("=IB3x", can_id, len(data)) + data    # Full CAN frame
-        
+    
             self.socket.send(frame)
-
+            
             logger.info(f"Sent CAN frame 0x{pgn:05X}")
             return True
 
@@ -478,8 +479,9 @@ class NMEA2000:
             data[1] = len (payload)             # payload length into the second byte
             data[2:8] = payload[:6]             # first 6 bytes
             self.send_can_frame (pri, pgn, data)
-
+            
             remaining_data = payload[6:]
+
             # Process the rest in chunks of 7
             # If the last chunk is shorter than 7 (uneven), slicing handles it naturally
             for i in range(0, len(remaining_data), 7):
@@ -490,7 +492,7 @@ class NMEA2000:
                 chunk = remaining_data[i : i + 7]
                 data[1 : 1 + len(chunk)] = chunk 
                 self.send_can_frame (pri, pgn, data)
-                
+
             return True
         else:
             return False
@@ -838,7 +840,6 @@ class XantrexService:
         alarm_response_pkt = data[:ALARM_IDX_FLAGS] + data[ALARM_IDX_FLAGS + 1: -3]
         raise_gui_alarm = 0                     # this gets sent to the GUI
 
-        print (f"{alarm_state=}")
         if alarm_state == ALARM_STATE_ACTIVE:
             self.nmea.send_nmea_message ("ACK_ALARM", alarm_response_pkt, ALARM_ACK_SILENCE)
             raise_gui_alarm = 1                 
