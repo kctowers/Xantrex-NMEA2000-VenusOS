@@ -78,7 +78,7 @@ PRODUCT_ID             = 1234
 FIRMWARE_VERSION       = '2.14'                 # hard coded, matches mine.
 XANTREX_INVERTER_MODEL = 2000                   # 2000 or 3000 Watt inverter
 PRODUCT_NAME           = 'Freedom XC Pro ' + str(XANTREX_INVERTER_MODEL) + ' Marine'
-SCRIPT_VERSION         = '1.0.1.2026.03.05'
+SCRIPT_VERSION         = '1.1.0.2026.03.21'
 
 # ManufacturerCode = 119
 
