@@ -302,56 +302,6 @@ class NMEA2000:
     # not sure what module this was to come from, but we need it to send a 29-bit CAN frame
     CAN_EFF_FLAG        = 0x80000000
 
-    # Define our NMEA transmit packet here 
-    # Fields without a 'value' key will pull from the function arguments
-    # Data types we support are: uint8, int8, uint16, int16, uint32, int32,
-    # string, and bytes
-    # ******************************************************************
-    # Note these inverter/charger control packets don't work yet.
-    # Still hoping for help from Xantrex Tech support.  These are based on
-    # info from the canboat reverse engineered NMEA data project
-    # ******************************************************************
-    TRANSMIT_PGN_MAP = {
-        'CONTROL_CHARGER': {                        # enable/disable charger packet
-            'PRI': 6,                               # priority 
-            'PGN': 0x1F216,                         # PGN
-            'FP': True,                             # is this a fast packet?
-            'DATA': {
-                'instance':                 {'type': 'uint8', 'value': 1},
-                'DC_instance':              {'type': 'uint8', 'value': 1},
-                'enable':                   {'type': 'uint8'},         # Variable (Param 1)
-                'charge_current_limit':     {'type': 'uint8', 'value': 100},  # percent 
-                'algorithm_mode':           {'type': 'uint8', 'value': 0}, 
-                'flags':                    {'type': 'uint8', 'value': 0}, 
-                'equalize_timet':           {'type': 'uint16', 'value': 0}, 
-            }                                          
-        },
-        'CONTROL_INVERTER': {                       # enable/disable inverter packet
-            'PRI': 6,                               # priority 
-            'PGN': 0x1F217,                         # PGN
-            'FP': True,                             # is this a fast packet?
-            'DATA': {
-                'instance':                 {'type': 'uint8', 'value': 1},
-                'AC_instance':              {'type': 'uint8', 'value': 2},
-                'DC_instance':              {'type': 'uint8', 'value': 1},
-                'enable':                   {'type': 'uint8'},         # Variable (Param 1)
-                'load_sense_threshold':     {'type': 'uint16', 'value': 25}, 
-                'load_sense_interval':      {'type': 'uint16', 'value': 200}, 
-            }                                          
-        },     
-        # This packet works as it should
-        'ACK_ALARM': {                              # send acknowledge packet 
-            'PRI': 6,                               # priority
-            'PGN': 0x1F008,                         # PGN
-            'FP': True,
-            'DATA': {
-                'response': {'type': 'bytes'},      # This will be a copy of the alarm packet received
-                'ack':      {'type': 'uint8'}       # This is the acknowledge type (silence, acknowledge) 
-            }
-        },
-    }    
-
-
     def __init__(self, can_address: int) -> None:
         self._rx_fpa = {                        # used to store Fast Packet assembly metadata
             'last_seq': 0,                      # last sequence number seen 
@@ -451,7 +401,7 @@ class NMEA2000:
             #     __u8    data[8] __attribute__((aligned(8)));
             # };
             frame      = struct.pack("=IB3x", can_id, len(data)) + data    # Full CAN frame
-    
+                             
             self.socket.send(frame)
             
             logger.info(f"Sent CAN frame 0x{pgn:05X}")
@@ -497,61 +447,71 @@ class NMEA2000:
         else:
             return False
 
-    # This method sends a NMEA packet defined above.  Optional parameters will
-    # need to be passed if the packet format requires them
-    def send_nmea_message(self, pkt_key, *args):
-        tx_pkt = self.TRANSMIT_PGN_MAP[pkt_key]
-        if (tx_pkt):
-            packed_data = bytearray()
-            arg_list = list(args)
-            arg_idx = 0
-            # '<' ensures Little-Endian (Standard for most modern hardware)
-            ENDIAN = "<"
+    # This method sends a NMEA packet as defined in the passed dictionary.
+    # Optional parameters will need to be passed if the packet format requires
+    # them
+    def send_nmea_message(self, pdu1_addr, tx_pkt, *args):
+        packed_data = bytearray()
+        arg_list = list(args)
+        arg_idx = 0
+        # '<' ensures Little-Endian (Standard for most modern hardware)
+        ENDIAN = "<"
 
-            pri = tx_pkt.get ("PRI")
-            pgn = tx_pkt.get ("PGN")
-            fast_packet = tx_pkt.get ("FP")
-            
-            for key, spec in tx_pkt["DATA"].items():
-                data_type = spec.get("type")
+        pri = tx_pkt.get ("PRI")
+        pgn = tx_pkt.get ("PGN")
 
-                # Determine if we use the static value or a passed parameter
-                if "value" in spec:
-                    value = spec["value"]
+        pdu = tx_pkt.get ("PDU")
+        # PDU1 packets are directed to a specific CAN address - in this
+        # case will always go to the inverter.
+        if (pdu == 1):
+            pgn |= pdu1_addr
+        # PDU2 packets already include the address and so don't mess with
+        # them
+
+        fast_packet = tx_pkt.get ("FP")
+
+        for key, spec in tx_pkt["DATA"].items():
+            data_type = spec.get("type")
+
+            # Determine if we use the static value or a passed parameter
+            if "value" in spec:
+                value = spec["value"]
+            else:
+                if arg_idx < len(arg_list):
+                    value = arg_list[arg_idx]
+                    arg_idx += 1
                 else:
-                    if arg_idx < len(arg_list):
-                        value = arg_list[arg_idx]
-                        arg_idx += 1
-                    else:
-                        raise ValueError(f"Missing parameter for variable field: {key}")
+                    raise ValueError(f"Missing parameter for variable field: {key}")
 
-                if data_type == "uint8":
-                    packed_data.extend(struct.pack(f"{ENDIAN}B", value))
-                elif data_type == "int8":
-                    packed_data.extend(struct.pack(f"{ENDIAN}b", value))
-                elif data_type == "uint16":
-                    packed_data.extend(struct.pack(f"{ENDIAN}H", value))
-                elif data_type == "int16":
-                    packed_data.extend(struct.pack(f"{ENDIAN}h", value))
-                elif data_type == "uint32":
-                    packed_data.extend(struct.pack(f"{ENDIAN}I", value))
-                elif data_type == "int32":
-                    packed_data.extend(struct.pack(f"{ENDIAN}i", value))
-                elif data_type == "string":
-                    encoded = value.encode('utf-8')
-                    packed_data.extend(struct.pack(f"{len(encoded)}s", encoded))
-                elif data_type == "bytes":
-                    packed_data.extend(value)
-                else:
-                    raise TypeError(f"Unsupported data type: {data_type}")
+            if data_type == "uint8":
+                packed_data.extend(struct.pack(f"{ENDIAN}B", value))
+            elif data_type == "int8":
+                packed_data.extend(struct.pack(f"{ENDIAN}b", value))
+            elif data_type == "uint16":
+                packed_data.extend(struct.pack(f"{ENDIAN}H", value))
+            elif data_type == "int16":
+                packed_data.extend(struct.pack(f"{ENDIAN}h", value))
+            elif data_type == "uint24":
+                packed_data.extend(struct.pack('<I', value)[:3])
+            elif data_type == "int24":
+                packed_data.extend(struct.pack('<i', value)[:3])
+            elif data_type == "uint32":
+                packed_data.extend(struct.pack(f"{ENDIAN}I", value))
+            elif data_type == "int32":
+                packed_data.extend(struct.pack(f"{ENDIAN}i", value))
+            elif data_type == "string":
+                encoded = value.encode('utf-8')
+                packed_data.extend(struct.pack(f"{len(encoded)}s", encoded))
+            elif data_type == "bytes":
+                packed_data.extend(value)
+            else:
+                raise TypeError(f"Unsupported data type: {data_type}")
 
-            # now transmit the frame depending on the frame type
-            if fast_packet:
-                return self.send_fast_packet (pri, pgn, packed_data)
-            else:                   
-                return self.send_can_frame (pri, pgn, packed_data)
-        else:
-            logger.error(f"Unknown transmit packet key {pkt_key}:")
+        # now transmit the frame depending on the frame type
+        if fast_packet:
+            return self.send_fast_packet (pri, pgn, packed_data)
+        else:                   
+            return self.send_can_frame (pri, pgn, packed_data)
             
 
     # Only CAN frames that are declared part of a multiple frame message will
@@ -582,7 +542,7 @@ class NMEA2000:
     def format_can_frame(self, PGN, data):
         hexdata = ' '.join(f'{b:02X}' for b in data)
         return f"PGN=0x{PGN:05X} | DLC={len(data)} | Data={hexdata}"
-
+                          
     # Process a single incoming CAN frame, decode its NMEA data, and update D-Bus paths.
     # Args:
     #    source: File descriptor of the CAN socket.
@@ -641,6 +601,64 @@ class NMEA2000:
 
 # === D-Bus Service Class ===
 class XantrexService:
+    
+    # Define our NMEA transmit packet here 
+    # Fields without a 'value' key will pull from the function arguments
+    # Data types we support are: uint8, int8, uint16, int16, uint24, int24,
+    # uint32, int32, string, and bytes
+    # ******************************************************************
+    TRANSMIT_PGN_MAP = {
+        'CONTROL_CHARGER': {                        # enable/disable charger packet
+            'PRI': 6,                               # priority 
+            'PGN': 0x1ED00,                         # NMEA command group message
+            'PDU': 1,                               # PDU type 1 or 2 
+            'FP': True,                             # is this a fast packet?
+            'DATA': {
+                'cmd':          {'type': 'uint8',  'value': 1},          # command message
+                'pgn':          {'type': 'uint24', 'value': 0x1F217},    # PGN - charger config status
+                'pri':          {'type': 'uint8', 'value': 0xf8},
+                'num_pairs':    {'type': 'uint8', 'value': 3}, # number of pairs of commanded parameters
+                'field1':       {'type': 'uint8', 'value': 1}, # field number of first pair
+                'instance':     {'type': 'uint8', 'value': 1},
+                'field2':       {'type': 'uint8', 'value': 2}, # field number of second pair                                   
+                'BAT_instance': {'type': 'uint8', 'value': 1},                                                                 
+                'field3':       {'type': 'uint8', 'value': 3}, # field number of third pair                                    
+                'enable':       {'type': 'uint8'},             # Variable (Param 1) 0 = disable, 1 = enable, 11 leave unchanged
+            }                                          
+        },
+        'CONTROL_INVERTER': {                       # enable/disable inverter packet
+            'PRI': 6,                               # priority 
+            'PGN': 0x1ED00,                         # NMEA command group message
+            'PDU': 1,                               # PDU type 1 or 2 
+            'FP': True,                             # is this a fast packet?
+            'DATA': {
+                'cmd':          {'type': 'uint8',  'value': 1},          # command message
+                'pgn':          {'type': 'uint24', 'value': 0x1F217},    # PGN - inverter config status
+                'pri':          {'type': 'uint8', 'value': 0xf8},
+                'num_pairs':    {'type': 'uint8', 'value': 4}, # number of pairs of commanded parameters
+                'field1':       {'type': 'uint8', 'value': 1}, # field number of first pair
+                'instance':     {'type': 'uint8', 'value': 1},
+                'field2':       {'type': 'uint8', 'value': 2}, # field number of second pair                                   
+                'AC_instance':  {'type': 'uint8', 'value': 2},                                                                 
+                'field3':       {'type': 'uint8', 'value': 3}, # field number of third pair                                    
+                'DC_instance':  {'type': 'uint8', 'value': 1},                                                                 
+                'field4':       {'type': 'uint8', 'value': 4}, # field number of forth pair                                    
+                'enable':       {'type': 'uint8'},             # Variable (Param 1) 0 = disable, 1 = enable, 11 leave unchanged
+            }                                          
+        },     
+        # This packet works as it should
+        'ACK_ALARM': {                              # send acknowledge packet 
+            'PRI': 6,                               # priority
+            'PGN': 0x1F008,                         # PGN
+            'PDU': 2,                               # PDU type 1 or 2 
+            'FP': True,
+            'DATA': {
+                'response': {'type': 'bytes'},      # This will be a copy of the alarm packet received
+                'ack':      {'type': 'uint8'}       # This is the acknowledge type (silence, acknowledge) 
+            }
+        },
+    }    
+
     def __init__(self):
         self.known_alarms = [ 2, 3 ]            # temporary to help flush out unknown alarm codes
         self.unknown_alarm_logged = []          # which alarms have we already captured
@@ -715,6 +733,8 @@ class XantrexService:
         self.last_heartbeat      = time.time()  # Timestamp of last valid frame received
         self.heartbeat_counter   = 0            
         self.isthereaframe       = 0            
+        self._xantrex_addr       = 0            # address of the XANTREX inverter
+            
         
         logger.info(f"Initializing Xantrex Service on {CAN_INTERFACE}")
 
@@ -789,18 +809,18 @@ class XantrexService:
     # GUI.  We use it to change the mode that the inverter/charger is working
     # in.
     def handle_mode_change (self, path, requested_mode):
-        if (requested_mode == MODE_OFF): 
-            self.nmea.send_nmea_message ("CONTROL_CHARGER", 0)
-            self.nmea.send_nmea_message ("CONTROL_INVERTER", 0)
+        if (requested_mode == MODE_OFF):
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_CHARGER"], 0)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_INVERTER"], 0)
         elif (requested_mode == MODE_INVERTER): 
-            self.nmea.send_nmea_message ("CONTROL_CHARGER", 0)
-            self.nmea.send_nmea_message ("CONTROL_INVERTER", 1)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_CHARGER"], 0)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_INVERTER"], 1)
         elif (requested_mode == MODE_CHARGER): 
-            self.nmea.send_nmea_message ("CONTROL_CHARGER", 1)
-            self.nmea.send_nmea_message ("CONTROL_INVERTER", 0)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_CHARGER"], 1)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_INVERTER"], 0)
         elif (requested_mode == MODE_ON):                   
-            self.nmea.send_nmea_message ("CONTROL_CHARGER", 1)
-            self.nmea.send_nmea_message ("CONTROL_INVERTER", 1)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_CHARGER"], 1)
+            self.nmea.send_nmea_message (self._xantrex_addr, self.TRANSMIT_PGN_MAP["CONTROL_INVERTER"], 1)
 
         self._InverterService[path] = requested_mode
         return True                       
@@ -916,7 +936,7 @@ class XantrexService:
         self.isthereaframe = 1                  # indicate that there is CAN acitivity
         
         # Look up this PGN in our pre-built map.
-        PGN_dict = self.INVERTER_RX_PGN_MAP.get(pgn) 
+        PGN_dict = self.INVERTER_RX_PGN_MAP.get(pgn)
 
         # if this is a multiple CAN packet frame, then it needs to be assembled
         if PGN_dict['Fast_Packet']:
@@ -949,6 +969,10 @@ class XantrexService:
                     if value is None:
                         skipped_none += 1    
                         continue
+                    
+                    # if we're processing this packet, then it is one we've
+                    # defined as coming from the inverter.
+                    self._xantrex_addr = src            # remember the where this packet came from
 
                     # special odd handling, I have not come up with a cleaner way to deal with.  
                     # if inverter reports Inverting but current is 0, force Standby ---
